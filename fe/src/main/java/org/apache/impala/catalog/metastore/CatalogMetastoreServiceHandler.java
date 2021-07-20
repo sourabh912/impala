@@ -43,17 +43,16 @@ import org.apache.hadoop.hive.metastore.api.PartitionsRequest;
 import org.apache.hadoop.hive.metastore.api.PartitionsResponse;
 import org.apache.hadoop.hive.metastore.api.SeedTableWriteIdsRequest;
 import org.apache.hadoop.hive.metastore.api.SeedTxnIdRequest;
-import org.apache.impala.catalog.CatalogException;
-import org.apache.impala.catalog.CatalogHmsAPIHelper;
-import org.apache.impala.catalog.CatalogServiceCatalog;
-import org.apache.impala.common.Metrics;
-import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.catalog.*;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.List;
+import java.util.Map;
 
 /**
  * This class implements the HMS APIs that are served by CatalogD
@@ -155,5 +154,452 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
             .getTbl_name();
     LOG.info(String.format(HMS_FALLBACK_MSG_FORMAT, GET_PARTITION_BY_NAMES, tblName));
     return super.get_partitions_by_names_req(getPartitionsByNamesRequest);
+  }
+
+  @Override
+  public void alter_database(String dbname, Database database)
+      throws MetaException, NoSuchObjectException, TException {
+    /**
+     * fallback to default HMS implementation if
+     i) catalogdHMS cache is disabled
+     or
+     ii) syncToLatestEventID_ is false
+     **/
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.alter_database(dbname, database);
+    }
+
+    String apiName = HmsApiNameEnum.ALTER_DATABASE.apiName();
+    Db db = catalog_.getDb(dbname);
+    if (db == null) {
+      rethrowException(new CatalogException("Database: " +
+              dbname + " does not exist in cache"),
+          HmsApiNameEnum.ALTER_DATABASE);
+    }
+    if (!catalog_.tryLockDb(db)) {
+      rethrowException(
+          new CatalogException("Couldn't acquire write lock on db: " + db.getName()) +
+              " when executing HMS API: " + apiName);
+    }
+    // long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
+    catalog_.getLock().writeLock().unlock();
+
+    try {
+      super.alter_database(dbname, database);
+      LOG.debug("Successfully executed HMS API: " + apiName);
+      catalogOpExecutor_.syncToLatestEventId(Db db, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      db.getLock().unlock();
+    }
+  }
+
+  @Override
+  public void alter_table(String dbname, String tblName,
+      org.apache.hadoop.hive.metastore.api.Table newTable) throws
+      InvalidOperationException, MetaException, TException {
+
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.alter_table(dbname, tblName, newTable);
+    }
+
+    String apiName = HmsApiNameEnum.ALTER_TABLE.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname, tblName,
+        apiName);
+
+    boolean isRename = !dbname.equalsIgnoreCase(newTable.getDbName()) ||
+        !tblName.equalsIgnoreCase(newTable.getTableName());
+
+    if (!isRename) {
+      // release lock if it is not rename
+      // For rename operation the lock would
+      // get released in finally block
+      catalog_.getLock().writeLock().unlock();
+    }
+
+    // TODO: Handle rename table differently
+    try {
+      // perform HMS operation
+      super.alter_table(dbname, tblName, newTable);
+      LOG.debug("Successfully executed HMS api:" + apiName);
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      // release version write lock if rename operation
+      if (isRename) {
+        catalog_.getLock().writeLock().unlock();
+      }
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public Partition add_partition(Partition partition)
+      throws InvalidObjectException, AlreadyExistsException, MetaException, TException {
+
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.add_partition(partition);
+    }
+    String apiName = HmsApiNameEnum.ADD_PARTITION.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(partition.getDbName(),
+        partition.getTableName(), apiName);
+    catalog_.getLock().writeLock().unlock();
+    Partition addedPartition = super.add_partition(partition);
+    LOG.debug("Successfully executed HMS API:" + apiName);
+
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+    return addedPartition;
+  }
+
+  @Override
+  public Partition append_partition(String dbname, String tblName, List<String> partVals)
+      throws InvalidObjectException, AlreadyExistsException, MetaException, TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.append_partition(dbname, tblName, partVals);
+    }
+    String apiName = HmsApiNameEnum.APPEND_PARTITION.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname,
+        tblName, apiName);
+    catalog_.getLock().writeLock().unlock();
+    Partition partition = super.append_partition(dbname, tblName, partVals);
+    LOG.debug("Successfully executed HMS API: append_partition");
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+    return partition;
+  }
+
+  @Override
+  public boolean drop_partition(String dbname, String tblname, List<String> partVals,
+                                boolean deleteData)
+      throws NoSuchObjectException, MetaException, TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.drop_partition(dbname, tblname, partVals, deleteData);
+    }
+    String apiName = HmsApiNameEnum.DROP_PARTITION.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname,
+        tblname, apiName);
+    catalog_.getLock().writeLock().unlock();
+    boolean resp = super.drop_partition(dbname, tblname, partVals, deleteData);
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+    return resp;
+  }
+
+  @Override
+  public boolean drop_partition_with_environment_context(String dbname, String tblname,
+      List<String> partNames, boolean deleteData, EnvironmentContext environmentContext)
+      throws NoSuchObjectException, MetaException, TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.drop_partition_with_environment_context(dbname, tblname, partNames,
+          deleteData, environmentContext);
+    }
+
+    String apiName = HmsApiNameEnum.DROP_PARTITION_WITH_ENVIRONMENT_CONTEXT.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname,
+        tblname, apiName);
+    catalog_.getLock().writeLock().unlock();
+    boolean resp = super.drop_partition_with_environment_context(dbname, tblname,
+        partNames, deleteData, environmentContext);
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+    return resp;
+  }
+
+  @Override
+  public Partition exchange_partition(Map<String, String> partitionSpecMap,
+                                      String sourcedb, String sourceTbl,
+                                      String destDb, String destTbl)
+      throws TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.exchange_partition(partitionSpecMap, sourcedb,
+          sourceTbl, destDb, destTbl);
+    }
+
+    // acquire lock on multiple tables at once
+    String apiName = HmsApiNameEnum.EXCHANGE_PARTITIONS.apiName();
+    Table srcTbl, destinationTbl;
+    try {
+      srcTbl = catalogOpExecutor_.getExistingTable(sourcedb, sourceTbl, apiName);
+      destinationTbl = catalogOpExecutor_.getExistingTable(destDb, destTbl, apiName);
+    } catch (Exception e) {
+      rethrowException(e, apiName);
+    }
+
+    if (!catalog_.tryWriteLock(new Table[] {srcTbl, destinationTbl})) {
+      rethrowException(new CatalogException("Couldn't acquire lock on tables: "
+          + srcTbl.getFullName() + ", " + destinationTbl.getFullName()), apiName);
+    }
+
+    Partition exchangedPartition = super.exchange_partition(partitionSpecMap, sourcedb,
+        sourceTbl, destDb, destTbl);
+
+    try {
+      // TODO: Check if HMS events are generated for
+      // both source and dest table. If yes,
+      // sync both of them to latest event id
+      //catalogOpExecutor_.syncToLatestEventId(srcTbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      srcTbl.releaseWriteLock();
+      destinationTbl.releaseWriteLock();
+    }
+    return exchangedPartition;
+  }
+
+  @Override
+  public void alter_partition(String dbName, String tblName, Partition partition)
+      throws InvalidOperationException, MetaException, TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.alter_partition(dbName, tblName, partition);
+    }
+    String apiName = HmsApiNameEnum.ALTER_PARTITION.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname,
+        tblName, apiName);
+    catalog_.getLock().writeLock().unlock();
+    super.alter_partition(dbName, tblName, partition);
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public void alter_partitions(String dbName, String tblName, List<Partition> partitions)
+      throws InvalidOperationException, MetaException, TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.alter_partitions(dbName, tblName, partitions);
+    }
+    String apiName = HmsApiNameEnum.ALTER_PARTITIONS.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname,
+        tblName, apiName);
+    catalog_.getLock().writeLock().unlock();
+    super.super.alter_partitions(dbName, tblName, partitions);
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public void alter_partitions_with_environment_context(String dbName, String tblName,
+      List<Partition> list, EnvironmentContext environmentContext) throws
+      InvalidOperationException, MetaException, TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.alter_partitions(dbName, tblName, list, environmentContext);
+    }
+    String apiName = HmsApiNameEnum.ALTER_PARTITIONS_WITH_ENVIRONMENT_CONTEXT.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname,
+        tblName, apiName);
+    catalog_.getLock().writeLock().unlock();
+    super.alter_partitions(dbName, tblName, list, environmentContext);
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public AlterPartitionsResponse alter_partitions_req(
+      AlterPartitionsRequest alterPartitionsRequest)
+      throws InvalidOperationException, MetaException, TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.alter_partitions_req(alterPartitionsRequest);
+    }
+    String apiName = HmsApiNameEnum.ALTER_PARTITIONS_REQ.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname,
+        tblName, apiName);
+    catalog_.getLock().writeLock().unlock();
+    AlterPartitionsResponse response =
+        super.alter_partitions_req(alterPartitionsRequest);
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+    return response;
+  }
+
+  @Override
+  public void alter_partition_with_environment_context(String dbName, String tblName,
+      Partition partition, EnvironmentContext environmentContext)
+      throws InvalidOperationException, MetaException, TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.alter_partition_with_environment_context(dbName, tblName,
+          partition, environmentContext);
+    }
+    String apiName = HmsApiNameEnum.ALTER_PARTITION_WITH_ENVIRONMENT_CONTEXT.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname,
+        tblName, apiName);
+    catalog_.getLock().writeLock().unlock();
+    super.alter_partition_with_environment_context(dbName, tblName,
+        partition, environmentContext);
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public void rename_partition(String dbName, String tblName, List<String> list,
+      Partition partition) throws InvalidOperationException,
+      MetaException, TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.rename_partition(dbName, tblName, list, partition);
+    }
+    String apiName = HmsApiNameEnum.RENAME_PARTITION.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname,
+        tblName, apiName);
+    catalog_.getLock().writeLock().unlock();
+    super.rename_partition(dbName, tblName, list, partition);
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public RenamePartitionResponse rename_partition_req(
+      RenamePartitionRequest renamePartitionRequest)
+      throws InvalidOperationException, MetaException, TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.rename_partition_req(renamePartitionRequest);
+    }
+    String apiName = HmsApiNameEnum.RENAME_PARTITION_REQ.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname,
+        tblName, apiName);
+    catalog_.getLock().writeLock().unlock();
+    RenamePartitionResponse response =
+        super.rename_partition_req(renamePartitionRequest);
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+    return response;
+  }
+
+  public void drop_table_with_environment_context(String dbname, String tblname,
+      boolean deleteData, EnvironmentContext environmentContext)
+      throws NoSuchObjectException, MetaException, TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.drop_table_with_environment_context(dbname, tblname,
+          deleteData, environmentContext);
+    }
+    String apiName = HmsApiNameEnum.DROP_TABLE_WITH_ENVORONMENT_CONTEXT.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname,
+        tblName, apiName);
+    catalog_.getLock().writeLock().unlock();
+    super.drop_partition_by_name_with_environment_context(dbname, tblname,
+        deleteData, environmentContext);
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public void truncate_table(String dbName, String tblName, List<String> partNames)
+      throws MetaException, TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.truncate_table(dbName, tblName, partNames);
+    }
+    String apiName = HmsApiNameEnum.TRUNCATE_TABLE.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname,
+        tblName, apiName);
+    catalog_.getLock().writeLock().unlock();
+    super.truncate_table(dbName, tblName, partNames);
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public TruncateTableResponse truncate_table_req(
+      TruncateTableRequest req) throws MetaException, TException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !syncToLatestEventId_) {
+      return super.truncate_table_req(req);
+    }
+    String apiName = HmsApiNameEnum.TRUNCATE_TABLE_REQ.apiName();
+    org.apache.impala.catalog.Table tbl = getTableAndAcquireWriteLock(dbname,
+        tblName, apiName);
+    catalog_.getLock().writeLock().unlock();
+    TruncateTableResponse response = super.truncate_table_req(req);
+    try {
+      catalogOpExecutor_.syncToLatestEventId(tbl, apiName);
+    } finally {
+      catalogOpExecutor_.UnlockWriteLockIfErronouslyLocked();
+      tbl.releaseWriteLock();
+    }
+    return response;
+  }
+
+
+  private org.apache.impala.catalog.Table getTableAndAcquireWriteLock(String dbName,
+      String tblName, String apiName) throws TException {
+    org.apache.impala.catalog.Table tbl;
+    try {
+      tbl = catalogOpExecutor_.getExistingTable(dbName, tblName, apiName);
+    } catch (Exception e) {
+      rethrowException(e, apiName);
+    }
+    if (!catalog_.tryWriteLock(tbl)) {
+      // should it be an internal exception?
+      CatalogException e =
+          new CatalogException("Could not acquire lock on table: " +
+              tbl.getFullName());
+      rethrowException(e, apiName));
+    }
+    return tbl;
   }
 }
