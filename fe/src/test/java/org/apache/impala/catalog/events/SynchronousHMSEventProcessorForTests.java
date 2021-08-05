@@ -25,6 +25,7 @@ import org.apache.hadoop.hive.metastore.api.NotificationEventResponse;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogServiceCatalog;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.common.Metrics;
 import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.thrift.TException;
 
@@ -34,10 +35,15 @@ import org.apache.thrift.TException;
  */
 public class SynchronousHMSEventProcessorForTests extends MetastoreEventsProcessor {
 
-  SynchronousHMSEventProcessorForTests(
+  public SynchronousHMSEventProcessorForTests(
       CatalogOpExecutor catalogOpExecutor, long startSyncFromId,
       long pollingFrequencyInSec) throws CatalogException {
     super(catalogOpExecutor, startSyncFromId, pollingFrequencyInSec);
+  }
+
+  @Override
+  public Metrics getMetrics() {
+    return super.getMetrics();
   }
 
   @Override

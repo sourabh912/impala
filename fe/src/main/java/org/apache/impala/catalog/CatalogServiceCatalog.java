@@ -220,7 +220,7 @@ public class CatalogServiceCatalog extends Catalog {
   //value of timeout for the topic update thread while waiting on the table lock.
   private final long topicUpdateTblLockMaxWaitTimeMs_;
   //Default value of timeout for acquiring a table lock.
-  private static final long LOCK_RETRY_TIMEOUT_MS = 7200000;
+  public static final long LOCK_RETRY_TIMEOUT_MS = 7200000;
   // Time to sleep before retrying to acquire a table lock
   private static final int LOCK_RETRY_DELAY_MS = 10;
   // default value of table id in the GetPartialCatalogObjectRequest
@@ -254,7 +254,7 @@ public class CatalogServiceCatalog extends Catalog {
   private long lastResetStartVersion_ = INITIAL_CATALOG_VERSION;
 
   // Manages the scheduling of background table loading.
-  private final TableLoadingMgr tableLoadingMgr_;
+  private TableLoadingMgr tableLoadingMgr_;
 
   private final boolean loadInBackground_;
 
@@ -311,6 +311,7 @@ public class CatalogServiceCatalog extends Catalog {
   private final Set<String> blacklistedDbs_;
   // Tables that will be skipped in loading.
   private final Set<TableName> blacklistedTables_;
+  private final int numLoadingThreads_;
 
   /**
    * Initialize the CatalogServiceCatalog using a given MetastoreClientPool impl.
@@ -338,7 +339,7 @@ public class CatalogServiceCatalog extends Catalog {
     Preconditions.checkState(topicUpdateTblLockMaxWaitTimeMs_ >= 0,
         "topic_update_tbl_max_wait_time_ms must be positive");
     catalogServiceId_ = catalogServiceId;
-    tableLoadingMgr_ = new TableLoadingMgr(this, numLoadingThreads);
+    numLoadingThreads_ = numLoadingThreads;
     loadInBackground_ = loadInBackground;
     try {
       // We want only 'true' HDFS filesystems to poll the HDFS cache (i.e not S3,
@@ -364,6 +365,7 @@ public class CatalogServiceCatalog extends Catalog {
         "Start events processor called before initializing it");
     metastoreEventProcessor_.start();
   }
+
 
   /**
    * Initializes the Catalog using the default MetastoreClientPool impl.
@@ -2137,8 +2139,13 @@ public class CatalogServiceCatalog extends Catalog {
       tbl = getTable(dbName, tblName);
       // tbl doesn't exist in the catalog
       if (tbl == null) return null;
+      LOG.debug("table {} exits in cache, last synced id {}", tbl.getFullName(),
+          tbl.getLastSyncedEventId());
       // if no validWriteIdList is provided, we return the tbl if its loaded
-      if (tbl.isLoaded() && validWriteIdList == null) return tbl;
+      if (tbl.isLoaded() && validWriteIdList == null) {
+        LOG.debug("returning already loaded table {}", tbl.getFullName());
+        return tbl;
+      }
       // if a validWriteIdList is provided, we see if the cached table can provided a
       // consistent view of the given validWriteIdList. If yes, we can return the table
       // otherwise we reload the table. It is possible that the cached table is stale
@@ -2189,6 +2196,7 @@ public class CatalogServiceCatalog extends Catalog {
               .inc();
         }
         previousCatalogVersion = tbl.getCatalogVersion();
+        LOG.info("Loading full table {}", tbl.getFullName());
         loadReq = tableLoadingMgr_.loadAsync(tableName, tbl.getCreateEventId(), reason);
       }
     } finally {
@@ -2239,8 +2247,12 @@ public class CatalogServiceCatalog extends Catalog {
                  && (!(existingTbl instanceof HdfsTable)
                         || AcidUtils.compare((HdfsTable) existingTbl,
                                updatedTbl.getValidWriteIds(), tableId)
-                            >= 0)))
+                            >= 0))) {
+        LOG.debug("returning existing table {} with last synced id: ",
+            existingTbl.getFullName(), existingTbl.getLastSyncedEventId());
         return existingTbl;
+      }
+
 
       if (existingTbl instanceof HdfsTable) {
         // Add the old instance to the deleteLog_ so we can send isDeleted updates for
@@ -2640,12 +2652,25 @@ public class CatalogServiceCatalog extends Catalog {
     try {
       Table table = getTable(dbName, tblName);
       if (table == null || table instanceof IncompleteTable) return false;
+      // TODO: If reloadTable succeeds, should we sync table till current HMS
+      // event id since it is a full table reload ?
       reloadTable(table, reason);
     } catch (DatabaseNotFoundException | TableLoadingException e) {
       LOG.info(String.format("Reload table if exists failed with: %s", e.getMessage()));
       return false;
     }
     return true;
+  }
+
+  @Override
+  public Table getTable(String dbName, String tblName)
+      throws DatabaseNotFoundException{
+    versionLock_.readLock().lock();
+    try {
+      return super.getTable(dbName, tblName);
+    } finally {
+      versionLock_.readLock().unlock();
+    }
   }
 
   /**
@@ -3616,5 +3641,16 @@ public class CatalogServiceCatalog extends Catalog {
   @VisibleForTesting
   public void setCatalogMetastoreServer(ICatalogMetastoreServer catalogMetastoreServer) {
     this.catalogMetastoreServer_ = catalogMetastoreServer;
+  }
+
+  public void setTableLoadingMgr(TableLoadingMgr tableLoadingMgr) {
+    Preconditions.checkArgument(tableLoadingMgr != null,
+        "tableLoadingMgr in argument should be non null");
+    tableLoadingMgr_ = tableLoadingMgr;
+  }
+  public void startTableLoadingManager() {
+    Preconditions.checkNotNull(tableLoadingMgr_,
+        "tableLoadingMgr_.start() called before initialising it");
+    tableLoadingMgr_.start();
   }
 }

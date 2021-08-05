@@ -117,6 +117,7 @@ import org.apache.impala.catalog.RowFormat;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.TableLoadingException;
+import org.apache.impala.catalog.TableLoadingMgr;
 import org.apache.impala.catalog.TableNotFoundException;
 import org.apache.impala.catalog.Transaction;
 import org.apache.impala.catalog.Type;
@@ -885,6 +886,54 @@ public class CatalogOpExecutor {
       return true;
     } finally {
       getMetastoreDdlLock().unlock();
+    }
+  }
+
+  /**
+   * Updates the catalog db with alteredMsDb. To do so, first acquire lock on catalog db
+   * and then metastore db is updated. Also update the event id in the db.
+   * No update is done if the catalog db is already synced till this event id
+   * @param eventId: HMS event id for this alter db operation
+   * @param alteredMsDb: metastore db to update in catalogd
+   * @return: true if metastore db was updated in catalog's db
+   *          false otherwise
+   */
+  public boolean alterDbIfExists(long eventId,
+      org.apache.hadoop.hive.metastore.api.Database alteredMsDb) {
+    Preconditions.checkNotNull(alteredMsDb);
+    String dbName = alteredMsDb.getName();
+    Db dbToAlter = catalog_.getDb(dbName);
+    if (dbToAlter == null) {
+      LOG.debug("Event id: {}, not altering db {} since it does not exist in catalogd",
+          eventId, dbName);
+      return false;
+    }
+    boolean syncToLatestEventId =
+        BackendConfig.INSTANCE.enableCatalogdCacheSyncToLatestEventId();
+    boolean dbLocked = false;
+    try {
+      tryLock(dbToAlter, String.format("alter db from event id: %s", eventId));
+      catalog_.getLock().writeLock().unlock();
+      dbLocked = true;
+      if (syncToLatestEventId && dbToAlter.getLastSyncedEventId() >= eventId) {
+        LOG.debug("Not altering db {} from event id: {} since db is already synced "
+                + "till event id: {}", dbName, eventId, dbToAlter.getLastSyncedEventId());
+        return false;
+      }
+      boolean success = catalog_.updateDbIfExists(alteredMsDb);
+      // TODO: should event id be set only in case of success?
+      if (success) {
+        dbToAlter.setLastSyncedEventId(eventId);
+      }
+      return success;
+    } catch (Exception e) {
+      LOG.error("Event id: {}, failed to alter db {}. Error message: {}", eventId, dbName,
+          e.getMessage());
+      return false;
+    } finally {
+      if (dbLocked) {
+        dbToAlter.getLock().unlock();
+      }
     }
   }
 
@@ -1790,7 +1839,7 @@ public class CatalogOpExecutor {
    * addition that it checks if events processing is active or not. If not active,
    * returns an empty list.
    */
-  private List<NotificationEvent> getNextMetastoreEventsIfEnabled(long eventId,
+  public List<NotificationEvent> getNextMetastoreEventsIfEnabled(long eventId,
       NotificationFilter eventsFilter) throws ImpalaRuntimeException {
     if (!catalog_.isEventProcessingActive()) return Collections.emptyList();
     return MetastoreEventsProcessor
@@ -3860,8 +3909,17 @@ public class CatalogOpExecutor {
       throw new CatalogException(
           "Partition event " + eventId + " received on a non-hdfs table");
     }
+    boolean syncToLatestEventId =
+        BackendConfig.INSTANCE.enableCatalogdCacheSyncToLatestEventId();
+    boolean errorOccured = false;
     try {
       tryWriteLock(table, reason);
+      if (syncToLatestEventId && table.getLastSyncedEventId() >= eventId) {
+        LOG.info("Not adding partitions from event id: {} since table {} is already "
+                + "synced till event id {}", eventId, table.getFullName(),
+            table.getLastSyncedEventId());
+        return 0;
+      }
       long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
       catalog_.getLock().writeLock().unlock();
       HdfsTable hdfsTable = (HdfsTable) table;
@@ -3883,11 +3941,20 @@ public class CatalogOpExecutor {
       }
       return 0;
     } catch (InternalException | UnsupportedEncodingException e) {
+      errorOccured = true;
       throw new CatalogException(
           "Unable to add partition for table " + table.getFullName(), e);
     } finally {
+      //  set table's last sycned event id  if no error occurred and
+      //  table's last synced event id < current event id
+      if (!errorOccured && syncToLatestEventId &&
+          table.getLastSyncedEventId() < eventId) {
+        table.setLastSyncedEventId(eventId);
+      }
       UnlockWriteLockIfErronouslyLocked();
-      table.releaseWriteLock();
+      if (table.isWriteLockedByCurrentThread()) {
+        table.releaseWriteLock();
+      }
     }
   }
 
@@ -3985,8 +4052,18 @@ public class CatalogOpExecutor {
     if (!(table instanceof HdfsTable)) {
       throw new CatalogException("Partition event received on a non-hdfs table");
     }
+    boolean syncToLatestEventId =
+        BackendConfig.INSTANCE.enableCatalogdCacheSyncToLatestEventId();
+
+    boolean errorOccured = false;
     try {
       tryWriteLock(table, reason);
+      if (syncToLatestEventId && table.getLastSyncedEventId() >= eventId) {
+        LOG.info("Not dropping partitions from event id: {} since table {} is already "
+                + "synced till event id {}", eventId, table.getFullName(),
+            table.getLastSyncedEventId());
+        return 0;
+      }
       long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
       catalog_.getLock().writeLock().unlock();
       HdfsTable hdfsTable = (HdfsTable) table;
@@ -4040,9 +4117,16 @@ public class CatalogOpExecutor {
       table.setCatalogVersion(newCatalogVersion);
       return allTPartKeyVals.size();
     } catch (InternalException e) {
+      errorOccured = true;
       throw new CatalogException(
           "Unable to add partition for table " + table.getFullName(), e);
     } finally {
+      //  set table's last sycned event id  if no error occurred and
+      //  table's last synced event id < current event id
+      if (!errorOccured && syncToLatestEventId &&
+          table.getLastSyncedEventId() < eventId) {
+        table.setLastSyncedEventId(eventId);
+      }
       UnlockWriteLockIfErronouslyLocked();
       table.releaseWriteLock();
     }
@@ -4108,8 +4192,18 @@ public class CatalogOpExecutor {
     if (!(table instanceof HdfsTable)) {
       throw new CatalogException("Partition event received on a non-hdfs table");
     }
+    boolean syncToLatestEventId =
+        BackendConfig.INSTANCE.enableCatalogdCacheSyncToLatestEventId();
+
+    boolean errorOccured = false;
     try {
       tryWriteLock(table, reason);
+      if (syncToLatestEventId && table.getLastSyncedEventId() >= eventId) {
+        LOG.info("Not reloading partition from event id: {} since table {} is already "
+                + "synced till event id {}", eventId, table.getFullName(),
+            table.getLastSyncedEventId());
+        return false;
+      }
       long newCatalogVersion = catalog_.incrementAndGetCatalogVersion();
       catalog_.getLock().writeLock().unlock();
       HdfsTable hdfsTable = (HdfsTable) table;
@@ -4134,9 +4228,16 @@ public class CatalogOpExecutor {
       }
       return wasPartitionRefreshed.getRef();
     } catch (InternalException | UnsupportedEncodingException e) {
+      errorOccured = true;
       throw new CatalogException(
           "Unable to add partition for table " + table.getFullName(), e);
     } finally {
+      //  set table's last sycned event id  if no error occurred and
+      //  table's last synced event id < current event id
+      if (!errorOccured && syncToLatestEventId &&
+          table.getLastSyncedEventId() < eventId) {
+        table.setLastSyncedEventId(eventId);
+      }
       UnlockWriteLockIfErronouslyLocked();
       table.releaseWriteLock();
     }
@@ -4539,10 +4640,12 @@ public class CatalogOpExecutor {
    * to make sure that we don't keep adding events when they are not being garbage
    * collected.
    */
-  private void addToDeleteEventLog(long eventId, String objectKey) {
+  public void addToDeleteEventLog(long eventId, String objectKey) {
     if (!catalog_.isEventProcessingActive()) {
       LOG.trace("Not adding event {}:{} since events processing is not active", eventId,
           objectKey);
+      // TODO: create a separate patch for this
+      return;
     }
     catalog_.getMetastoreEventProcessor().getDeleteEventLog()
         .addRemovedObject(eventId, objectKey);
@@ -6234,35 +6337,6 @@ public class CatalogOpExecutor {
     return tbl;
   }
 
-  public void syncToLatestEventId(Table tbl, String reason) throws MetaException {
-    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
-    Preconditions.checkState(!(tbl instanceof IncompleteTable) &&
-        tbl.isLoaded());
-    // TODO: Should the table be only HDFSTable?
-    try {
-
-    } catch (Exception e) {
-      // Wrap the exception as MetaException and
-      // rethrow
-    }
-    // throw Excpetion until the implementation is supported
-    throw new UnsupportedOperationException("Sync to latest event id " +
-        "is currently not supported");
-  }
-
-  public void syncToLatestEventId(Db db, String reason) throws MetaException {
-    // Add precondition check for db write lock held by current thread
-    // Preconditions.checkState(db.isWriteLockedByCurrentThread());
-    try {
-
-    } catch (Exception e) {
-      // Wrap the exception as MetaException and
-      // rethrow
-    }
-    // throw Excpetion until the implementation is supported
-    throw new UnsupportedOperationException("Sync to latest event id " +
-        "is currently not supported");
-  }
 
   private void alterCommentOn(TCommentOnParams params, TDdlExecResponse response,
       Optional<TTableName> tTableName, boolean wantMinimalResult)

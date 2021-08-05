@@ -333,4 +333,18 @@ public class BackendConfig {
   public String getStartupFilesystemCheckDirectories() {
     return backendCfg_.startup_filesystem_check_directories;
   }
+
+  public boolean enableCatalogdCacheSyncToLatestEventId() {
+    return backendCfg_.enable_catalogd_cache_sync_to_latest_event_id;
+  }
+
+  @VisibleForTesting
+  public void setEnableCatalogdCacheSyncToLatestEventId(boolean flag) {
+    backendCfg_.enable_catalogd_cache_sync_to_latest_event_id = flag;
+  }
+
+  @VisibleForTesting
+  public void setInvalidateCatalogdHMSCacheOnDDLs(boolean flag) {
+    backendCfg_.invalidate_hms_cache_on_ddls = flag;
+  }
 }
