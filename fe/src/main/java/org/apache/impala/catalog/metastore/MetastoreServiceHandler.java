@@ -317,6 +317,8 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
   protected PartitionExpressionProxy expressionProxy_;
   protected final String defaultCatalogName_;
   protected final boolean invalidateCacheOnDDLs_;
+  // add a config after this feature is supported
+  protected final boolean syncToLatestEventId_ = false;
 
   public MetastoreServiceHandler(CatalogOpExecutor catalogOpExecutor,
       boolean fallBackToHMSOnErrors) {
@@ -1433,6 +1435,11 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
       throws TException {
     LOG.debug("Received exception while executing {}", apiName, cause);
     if (fallBackToHMSOnErrors_) return;
+    rethrowException(cause, apiName);
+  }
+
+  protected void rethrowException(Exception cause, String apiName)
+      throws TException {
     if (cause instanceof TException) throw (TException) cause;
     // if this is not a TException we wrap it to a MetaException
     throw new MetaException(
@@ -2908,6 +2915,13 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
   }
 
   /**
+   * Gets the current event id from the hive metastore.
+   */
+  private long getCurrentEventId(MetaStoreClient msClient) throws TException {
+    return msClient.getHiveClient().getCurrentNotificationEventId().getEventId();
+  }
+
+  /**
    * For non transactional tables, invalidate the table from cache
    * if hms ddl apis are accessed from catalogd's metastore server.
    * Any subsequent get table request fetches the table from HMS and loads
@@ -2923,8 +2937,14 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
    */
   private void invalidateNonTransactionalTableIfExists(String dbNameWithCatalog,
       String tableName, String apiName) throws MetaException {
-    // return immediately if flag invalidateCacheOnDDLs_ is false
-    if (!invalidateCacheOnDDLs_) {
+    // return immediately if
+    //     flag invalidateCacheOnDDLs_ is false
+    //                   or
+    //     catalogHMSCache is disabled
+    //                   or
+    //     syncToLatestEventId is true
+    if (!invalidateCacheOnDDLs_ || !BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        syncToLatestEventId_) {
       LOG.debug("Not invalidating table {}.{} from catalogd cache because " +
               "invalidateCacheOnDDLs_ flag is set to {} ", dbNameWithCatalog,
           tableName, invalidateCacheOnDDLs_);
@@ -2976,13 +2996,6 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
   }
 
   /**
-   * Gets the current event id from the hive metastore.
-   */
-  private long getCurrentEventId(MetaStoreClient msClient) throws TException {
-    return msClient.getHiveClient().getCurrentNotificationEventId().getEventId();
-  }
-
-  /**
    * This method is identical to invalidateNonTransactionalTableIfExists()
    * except that it
    * 1.removes both transactional and non transactional tables
@@ -2991,8 +3004,14 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
    */
   private void removeTableIfExists(long beforeDropEventId, String dbNameWithCatalog,
       String tableName, String apiName) throws MetaException {
-    // return immediately if flag invalidateCacheOnDDLs_ is false
-    if (!invalidateCacheOnDDLs_) {
+    // return immediately if
+    //     flag invalidateCacheOnDDLs_ is false
+    //                   or
+    //     catalogHMSCache is disabled
+    //                   or
+    //     syncToLatestEventId is true
+    if (!invalidateCacheOnDDLs_ || !BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        syncToLatestEventId_)  {
       LOG.debug("Not removing table {}.{} from catalogd cache because " +
               "invalidateCacheOnDDLs_ flag is set to {} ", dbNameWithCatalog,
           tableName, invalidateCacheOnDDLs_);
@@ -3054,7 +3073,8 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
       String oldTableName, String newDbNameWithCatalog, String newTableName,
       String apiName) throws MetaException {
     // return immediately if flag invalidateCacheOnDDLs_ is false
-    if (!invalidateCacheOnDDLs_) {
+    if (!invalidateCacheOnDDLs_ || !BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        syncToLatestEventId_)  {
       LOG.debug("invalidateCacheOnDDLs_ flag is false, skipping cache " +
               "update for operation {} on table {}.{}", apiName,
           oldDbNameWithCatalog, oldTableName);

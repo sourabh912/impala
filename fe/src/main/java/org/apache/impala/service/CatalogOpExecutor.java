@@ -661,7 +661,7 @@ public class CatalogOpExecutor {
    * This method checks if the write lock of 'catalog_' is unlocked. If it's still locked
    * then it logs an error and unlocks it.
    */
-  private void UnlockWriteLockIfErronouslyLocked() {
+  public void UnlockWriteLockIfErronouslyLocked() {
     if(catalog_.getLock().isWriteLockedByCurrentThread()) {
       LOG.error("Write lock should have been released.");
       catalog_.getLock().writeLock().unlock();
@@ -6206,7 +6206,7 @@ public class CatalogOpExecutor {
    * TODO: Track object IDs to
    * know when a table has been dropped and re-created with the same name.
    */
-  private Table getExistingTable(String dbName, String tblName, String reason)
+  public Table getExistingTable(String dbName, String tblName, String reason)
       throws CatalogException {
     // passing null validWriteIdList makes sure that we return the table if it is
     // already loaded.
@@ -6232,6 +6232,36 @@ public class CatalogOpExecutor {
     Preconditions.checkNotNull(tbl);
     Preconditions.checkState(tbl.isLoaded());
     return tbl;
+  }
+
+  public void syncToLatestEventId(Table tbl, String reason) throws MetaException {
+    Preconditions.checkState(tbl.isWriteLockedByCurrentThread());
+    Preconditions.checkState(!(tbl instanceof IncompleteTable) &&
+        tbl.isLoaded());
+    // TODO: Should the table be only HDFSTable?
+    try {
+
+    } catch (Exception e) {
+      // Wrap the exception as MetaException and
+      // rethrow
+    }
+    // throw Excpetion until the implementation is supported
+    throw new UnsupportedOperationException("Sync to latest event id " +
+        "is currently not supported");
+  }
+
+  public void syncToLatestEventId(Db db, String reason) throws MetaException {
+    // Add precondition check for db write lock held by current thread
+    // Preconditions.checkState(db.isWriteLockedByCurrentThread());
+    try {
+
+    } catch (Exception e) {
+      // Wrap the exception as MetaException and
+      // rethrow
+    }
+    // throw Excpetion until the implementation is supported
+    throw new UnsupportedOperationException("Sync to latest event id " +
+        "is currently not supported");
   }
 
   private void alterCommentOn(TCommentOnParams params, TDdlExecResponse response,

@@ -24,7 +24,25 @@ package org.apache.impala.catalog.metastore;
 public enum HmsApiNameEnum {
   GET_TABLE_REQ("get_table_req"),
   GET_PARTITION_BY_EXPR("get_partitions_by_expr"),
-  GET_PARTITION_BY_NAMES("get_partitions_by_names_req");
+  GET_PARTITION_BY_NAMES("get_partitions_by_names_req"),
+  ALTER_DATABASE("alter_database"),
+  ALTER_TABLE("alter_table"),
+  ADD_PARTITION("add_partition"),
+  APPEND_PARTITION("append_partition"),
+  DROP_PARTITION("drop_partition"),
+  DROP_PARTITION_WITH_ENVIRONMENT_CONTEXT("drop_partition_with_environment_context"),
+  ALTER_PARTITION("alter_partition"),
+  ALTER_PARTITIONS("alter_partitions"),
+  ALTER_PARTITIONS_WITH_ENVIRONMENT_CONTEXT("alter_partitions_with_environment_context"),
+  ALTER_PARTITIONS_REQ("alter_partitions_req"),
+  ALTER_PARTITION_WITH_ENVIRONMENT_CONTEXT("alter_partition_with_environment_context"),
+  RENAME_PARTITION("rename_partition"),
+  RENAME_PARTITION_REQ("rename_partition_req"),
+  EXCHANGE_PARTITIONS("exchange_partitions"),
+  DROP_TABLE("drop_table"),
+  DROP_TABLE_WITH_ENVORONMENT_CONTEXT("drop_table_with_environment_context"),
+  TRUNCATE_TABLE("truncate_table"),
+  TRUNCATE_TABLE_REQ("truncate_tale_req");
 
   private final String apiName;
 

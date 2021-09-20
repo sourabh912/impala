@@ -425,6 +425,46 @@ public class CatalogServiceCatalog extends Catalog {
     return tryLock(tbl, true, LOCK_RETRY_TIMEOUT_MS);
   }
 
+  /*
+  Acquire write lock on multiple tables
+  If the lock couldn't be acquired on any table,
+  then release the lock on previous tables and
+  return false. Otherwise return true if writelocks
+  were acquried on all tables
+   */
+  public boolean tryWriteLock(Table[] tables) {
+    StringBuilder tableInfo = new StringBuilder();
+    int numTables = tables.length;
+    if (LOG.isDebugEnabled()) {
+      for(int i = 0; i < numTables; i++) {
+        tableInfo.append(tables[i].getFullName());
+        if(i < numTables - 1) {
+          tableInfo.append(", ");
+        }
+      }
+      LOG.debug("Trying to acquire write locks for tables: " +
+          tableInfo.toString());
+    }
+
+    for(int i = 0; i < numTables; i++) {
+      Table tbl = tables[i];
+      if (!tryWriteLock(tbl)) {
+        LOG.debug("Could not acquire write lock on table: " + tbl.getFullName());
+        // unlock previously locked tables
+        for(int j = 0; j < i; j++) {
+          tables[j].releaseWriteLock();
+        }
+        return false;
+      }
+      // unlock version write lock for all tables
+      // except last
+      if (i < numTables-1) {
+        versionLock_.writeLock().unlock();
+      }
+    }
+    return true;
+  }
+
   /**
    * Tries to acquire the table similar to described in
    * {@link CatalogServiceCatalog#tryWriteLock(Table)} but with a custom timeout.
