@@ -108,12 +108,12 @@ DEFINE_bool(fallback_to_hms_on_errors, true, "This configuration is only used if
     "start_hms_server is true. This is used to determine if the Catalog should fallback "
     "to the backing HMS service if there are errors while processing the HMS request");
 
-DEFINE_bool(invalidate_hms_cache_on_ddls, true, "This configuration is used "
+DEFINE_bool(invalidate_hms_cache_on_ddls, false, "This configuration is used "
     "only if start_hms_server is true. This is used to invalidate catalogd cache "
     "for non transactional tables if alter/create/delete table hms apis are "
      "invoked over catalogd's metastore endpoint");
 
-DEFINE_bool(enable_catalogd_cache_sync_to_latest_event_id, false, "This configuration is "
+DEFINE_bool(enable_catalogd_cache_sync_to_latest_event_id, true, "This configuration is "
     "used to sync db/table in catalogd cache to latest hms event id whenever DDL "
     "operations are performed from Impala shell and catalog metastore server "
     "(if enabled)");
