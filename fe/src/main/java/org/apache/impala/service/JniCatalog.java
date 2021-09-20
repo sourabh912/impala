@@ -37,6 +37,7 @@ import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.MetaStoreClientPool;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.catalog.TableLoadingMgr;
 import org.apache.impala.catalog.events.ExternalEventsProcessor;
 import org.apache.impala.catalog.events.MetastoreEventsProcessor;
 import org.apache.impala.catalog.events.NoOpEventProcessor;
@@ -148,6 +149,10 @@ public class JniCatalog {
     authzManager_ = authzFactory.newAuthorizationManager(catalog_);
     catalog_.setAuthzManager(authzManager_);
     catalogOpExecutor_ = new CatalogOpExecutor(catalog_, authzConfig, authzManager_);
+    TableLoadingMgr tableLoadingMgr = new TableLoadingMgr(catalogOpExecutor_,
+        cfg.num_metadata_loading_threads);
+    catalog_.setTableLoadingMgr(tableLoadingMgr);
+    catalog_.startTableLoadingManager();
     ExternalEventsProcessor eventsProcessor = getEventsProcessor(metaStoreClientPool,
         catalogOpExecutor_);
     catalog_.setMetastoreEventProcessor(eventsProcessor);

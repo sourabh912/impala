@@ -113,6 +113,11 @@ DEFINE_bool(invalidate_hms_cache_on_ddls, true, "This configuration is used "
     "for non transactional tables if alter/create/delete table hms apis are "
      "invoked over catalogd's metastore endpoint");
 
+DEFINE_bool(enable_catalogd_cache_sync_to_latest_event_id, false, "This configuration is "
+    "used to sync db/table in catalogd cache to latest hms event id whenever DDL "
+    "operations are performed from Impala shell and catalog metastore server "
+    "(if enabled)");
+
 DECLARE_string(state_store_host);
 DECLARE_int32(state_store_subscriber_port);
 DECLARE_int32(state_store_port);

@@ -250,7 +250,7 @@ public class CatalogMetastoreServer extends ThriftHiveMetastore implements
   }
 
   @VisibleForTesting
-  protected int getPort() throws CatalogException {
+  public int getPort() throws CatalogException {
     return BackendConfig.INSTANCE.getHMSPort();
   }
 

@@ -31,6 +31,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.impala.common.Pair;
+import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.util.HdfsCachingUtil;
 import org.apache.log4j.Logger;
@@ -155,15 +156,19 @@ public class TableLoadingMgr {
   private final LinkedBlockingQueue<Pair<TTableName, String>> refreshThreadWork_ =
       new LinkedBlockingQueue<>();
 
-  private final CatalogServiceCatalog catalog_;
-  private final TableLoader tblLoader_;
+  private CatalogServiceCatalog catalog_;
+  private CatalogOpExecutor catalogOpExecutor_;
+  private TableLoader tblLoader_;
 
-  public TableLoadingMgr(CatalogServiceCatalog catalog, int numLoadingThreads) {
-    catalog_ = catalog;
-    tblLoader_ = new TableLoader(catalog_);
+  public TableLoadingMgr(CatalogOpExecutor catalogOpExecutor, int numLoadingThreads) {
+    catalogOpExecutor_ = catalogOpExecutor;
+    catalog_ = catalogOpExecutor_.getCatalog();
+    tblLoader_ = new TableLoader(catalogOpExecutor_);
     numLoadingThreads_ = numLoadingThreads;
     tblLoadingPool_ = Executors.newFixedThreadPool(numLoadingThreads_);
+  }
 
+  public void start() {
     // Start the background table loading submitter threads.
     startTableLoadingSubmitterThreads();
 

@@ -112,6 +112,7 @@ public class Db extends CatalogObjectImpl implements FeDb {
   // in hive metastore. Defaults to -1 for already existing databases or if events
   // processing is disabled.
   private long createEventId_ = -1;
+  private volatile long lastSyncedEventId_ = -1;
 
   public Db(String name, org.apache.hadoop.hive.metastore.api.Database msDb) {
     setMetastoreDb(name, msDb);
@@ -123,6 +124,14 @@ public class Db extends CatalogObjectImpl implements FeDb {
 
   public void setCreateEventId(long eventId) {
     createEventId_ = eventId;
+    setLastSyncedEventId(eventId);
+  }
+
+  public long getLastSyncedEventId() {
+    return lastSyncedEventId_;
+  }
+  public void setLastSyncedEventId(long eventId) {
+    lastSyncedEventId_ = eventId;
   }
 
   public void setIsSystemDb(boolean b) { isSystemDb_ = b; }
@@ -568,5 +577,13 @@ public class Db extends CatalogObjectImpl implements FeDb {
   public String getOwnerUser() {
     org.apache.hadoop.hive.metastore.api.Database db = getMetaStoreDb();
     return db == null ? null : db.getOwnerName();
+  }
+
+  /**
+   *
+   * @return True if dbLock_ is held by current thread
+   */
+  public boolean isLockHeldByCurrentThread() {
+    return dbLock_.isHeldByCurrentThread();
   }
 }
