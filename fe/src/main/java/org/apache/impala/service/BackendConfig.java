@@ -333,4 +333,18 @@ public class BackendConfig {
   public String getStartupFilesystemCheckDirectories() {
     return backendCfg_.startup_filesystem_check_directories;
   }
+
+  public boolean enableSyncToLatestEventOnDdls() {
+    return backendCfg_.enable_sync_to_latest_event_on_ddls;
+  }
+
+  @VisibleForTesting
+  public void setEnableSyncToLatestEventOnDdls(boolean flag) {
+    backendCfg_.enable_sync_to_latest_event_on_ddls = flag;
+  }
+
+  @VisibleForTesting
+  public void setInvalidateCatalogdHMSCacheOnDDLs(boolean flag) {
+    backendCfg_.invalidate_hms_cache_on_ddls = flag;
+  }
 }

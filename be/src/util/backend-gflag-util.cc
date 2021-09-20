@@ -97,6 +97,7 @@ DECLARE_bool(fallback_to_hms_on_errors);
 DECLARE_bool(enable_catalogd_hms_cache);
 DECLARE_string(kudu_sasl_protocol_name);
 DECLARE_bool(invalidate_hms_cache_on_ddls);
+DECLARE_bool(enable_sync_to_latest_event_on_ddls);
 
 // HS2 SAML2.0 configuration
 // Defined here because TAG_FLAG caused issues in global-flags.cc
@@ -313,6 +314,8 @@ Status PopulateThriftBackendGflags(TBackendGflags& cfg) {
   cfg.__set_invalidate_hms_cache_on_ddls(FLAGS_invalidate_hms_cache_on_ddls);
   cfg.__set_startup_filesystem_check_directories(
       FLAGS_startup_filesystem_check_directories);
+  cfg.__set_enable_sync_to_latest_event_on_ddls(
+      FLAGS_enable_sync_to_latest_event_on_ddls);
   return Status::OK();
 }
 

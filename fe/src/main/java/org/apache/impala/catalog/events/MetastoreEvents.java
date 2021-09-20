@@ -50,13 +50,16 @@ import org.apache.impala.analysis.TableName;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogServiceCatalog;
 import org.apache.impala.catalog.DatabaseNotFoundException;
+import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.HdfsTable;
+import org.apache.impala.catalog.IncompleteTable;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.catalog.TableNotFoundException;
 import org.apache.impala.catalog.TableNotLoadedException;
 import org.apache.impala.common.Metrics;
 import org.apache.impala.common.Reference;
 import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.thrift.TPartitionKeyValue;
 import org.apache.impala.thrift.TTableName;
@@ -146,51 +149,51 @@ public class MetastoreEvents {
         LoggerFactory.getLogger(MetastoreEventFactory.class);
 
     // catalog service instance to be used for creating eventHandlers
-    private final CatalogServiceCatalog catalog_;
+    protected final CatalogServiceCatalog catalog_;
     // metrics registry to be made available for each events to publish metrics
-    private final Metrics metrics_;
+    //protected final Metrics metrics_;
     // catalogOpExecutor needed for the create/drop events for table and database.
-    private final CatalogOpExecutor catalogOpExecutor_;
+    protected final CatalogOpExecutor catalogOpExecutor_;
+    private static MetastoreEventFactory INSTANCE = null;
 
-    public MetastoreEventFactory(CatalogOpExecutor catalogOpExecutor, Metrics metrics) {
+    public MetastoreEventFactory(CatalogOpExecutor catalogOpExecutor) {
       this.catalogOpExecutor_ = Preconditions.checkNotNull(catalogOpExecutor);
       this.catalog_ = Preconditions.checkNotNull(catalogOpExecutor.getCatalog());
-      this.metrics_ = Preconditions.checkNotNull(metrics);
     }
 
     /**
      * creates instance of <code>MetastoreEvent</code> used to process a given event type.
      * If the event type is unknown, returns a IgnoredEvent
      */
-    public MetastoreEvent get(NotificationEvent event)
+    public MetastoreEvent get(NotificationEvent event, Metrics metrics)
         throws MetastoreNotificationException {
       Preconditions.checkNotNull(event.getEventType());
       MetastoreEventType metastoreEventType =
           MetastoreEventType.from(event.getEventType());
       switch (metastoreEventType) {
         case CREATE_TABLE:
-          return new CreateTableEvent(catalogOpExecutor_, metrics_, event);
+          return new CreateTableEvent(catalogOpExecutor_, metrics, event);
         case DROP_TABLE:
-          return new DropTableEvent(catalogOpExecutor_, metrics_, event);
+          return new DropTableEvent(catalogOpExecutor_, metrics, event);
         case ALTER_TABLE:
-          return new AlterTableEvent(catalogOpExecutor_, metrics_, event);
+          return new AlterTableEvent(catalogOpExecutor_, metrics, event);
         case CREATE_DATABASE:
-          return new CreateDatabaseEvent(catalogOpExecutor_, metrics_, event);
+          return new CreateDatabaseEvent(catalogOpExecutor_, metrics, event);
         case DROP_DATABASE:
-          return new DropDatabaseEvent(catalogOpExecutor_, metrics_, event);
+          return new DropDatabaseEvent(catalogOpExecutor_, metrics, event);
         case ALTER_DATABASE:
-          return new AlterDatabaseEvent(catalogOpExecutor_, metrics_, event);
+          return new AlterDatabaseEvent(catalogOpExecutor_, metrics, event);
         case ADD_PARTITION:
-          return new AddPartitionEvent(catalogOpExecutor_, metrics_, event);
+          return new AddPartitionEvent(catalogOpExecutor_, metrics, event);
         case DROP_PARTITION:
-          return new DropPartitionEvent(catalogOpExecutor_, metrics_, event);
+          return new DropPartitionEvent(catalogOpExecutor_, metrics, event);
         case ALTER_PARTITION:
-          return new AlterPartitionEvent(catalogOpExecutor_, metrics_, event);
+          return new AlterPartitionEvent(catalogOpExecutor_, metrics, event);
         case INSERT:
-          return new InsertEvent(catalogOpExecutor_, metrics_, event);
+          return new InsertEvent(catalogOpExecutor_, metrics, event);
         default:
           // ignore all the unknown events by creating a IgnoredEvent
-          return new IgnoredEvent(catalogOpExecutor_, metrics_, event);
+          return new IgnoredEvent(catalogOpExecutor_, metrics, event);
       }
     }
 
@@ -207,18 +210,19 @@ public class MetastoreEvents {
      * dropped. In such a case, the create event can be ignored
      *
      * @param events NotificationEvents fetched from metastore
+     * @param metrics Metrics to update while filtering events
      * @return A list of MetastoreEvents corresponding to the given the NotificationEvents
      * @throws MetastoreNotificationException if a NotificationEvent could not be
      *     parsed into MetastoreEvent
      */
-    List<MetastoreEvent> getFilteredEvents(List<NotificationEvent> events)
-        throws MetastoreNotificationException {
+    List<MetastoreEvent> getFilteredEvents(List<NotificationEvent> events,
+        Metrics metrics) throws MetastoreNotificationException {
       Preconditions.checkNotNull(events);
       if (events.isEmpty()) return Collections.emptyList();
 
       List<MetastoreEvent> metastoreEvents = new ArrayList<>(events.size());
       for (NotificationEvent event : events) {
-        metastoreEvents.add(get(event));
+        metastoreEvents.add(get(event, metrics));
       }
       // filter out the create events which has a corresponding drop event later
       int sizeBefore = metastoreEvents.size();
@@ -253,11 +257,11 @@ public class MetastoreEvents {
       }
       LOG.info(String.format("Total number of events received: %d Total number of events "
           + "filtered out: %d", sizeBefore, numFilteredEvents));
-      metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+      metrics.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
               .inc(numFilteredEvents);
-      LOG.debug("Incremented skipped metric to " + metrics_
+      LOG.debug("Incremented skipped metric to " + metrics
           .getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).getCount());
-      return createBatchEvents(metastoreEvents);
+      return createBatchEvents(metastoreEvents, metrics);
     }
 
     /**
@@ -266,7 +270,7 @@ public class MetastoreEvents {
      * events depending on whether it finds any events which could be batched together.
      */
     @VisibleForTesting
-    List<MetastoreEvent> createBatchEvents(List<MetastoreEvent> events) {
+    List<MetastoreEvent> createBatchEvents(List<MetastoreEvent> events, Metrics metrics) {
       if (events.size() < 2) return events;
       int i = 0, j = 1;
       List<MetastoreEvent> batchedEventList = new ArrayList<>();
@@ -283,7 +287,7 @@ public class MetastoreEvents {
           if (current.getNumberOfEvents() > 1) {
             current.infoLog("Created a batch event for {} events from {} to {}",
                 current.getNumberOfEvents(), startEventId, current.getEventId());
-            metrics_.getCounter(MetastoreEventsProcessor.NUMBER_OF_BATCH_EVENTS).inc();
+            metrics.getCounter(MetastoreEventsProcessor.NUMBER_OF_BATCH_EVENTS).inc();
           }
           batchedEventList.add(current);
           current = next;
@@ -297,12 +301,85 @@ public class MetastoreEvents {
       if (current.getNumberOfEvents() > 1) {
         current.infoLog("Created a batch event for {} events from {} to {}",
             current.getNumberOfEvents(), startEventId, current.getEventId());
-        metrics_.getCounter(MetastoreEventsProcessor.NUMBER_OF_BATCH_EVENTS).inc();
+        metrics.getCounter(MetastoreEventsProcessor.NUMBER_OF_BATCH_EVENTS).inc();
       }
       batchedEventList.add(current);
       return batchedEventList;
     }
   }
+
+
+  // A factory class for creating metastore events for syncing to latest event id
+  // TODO: Should we skip creating a new metastore events factory
+  // and instead disable self events check in MetastoreEventFactory itself
+  // if sync to latest event id is true ?
+
+  public static class EventFactoryForSyncToLatestEvent extends
+      MetastoreEvents.MetastoreEventFactory {
+
+    private static final Logger LOG =
+        LoggerFactory.getLogger(MetastoreEventFactory.class);
+
+    private static EventFactoryForSyncToLatestEvent INSTANCE = null;
+
+    public EventFactoryForSyncToLatestEvent(CatalogOpExecutor catalogOpExecutor) {
+      super(catalogOpExecutor);
+    }
+
+    public MetastoreEvent get(NotificationEvent event, Metrics metrics)
+        throws MetastoreNotificationException {
+      Preconditions.checkNotNull(event.getEventType());
+      MetastoreEventType metastoreEventType =
+          MetastoreEventType.from(event.getEventType());
+      switch (metastoreEventType) {
+        case ALTER_DATABASE:
+          return new AlterDatabaseEvent(catalogOpExecutor_, metrics, event) {
+            @Override
+            protected boolean isSelfEvent() {
+              return false;
+            }
+          };
+        case ALTER_TABLE:
+          return new AlterTableEvent(catalogOpExecutor_, metrics, event) {
+            @Override
+            protected boolean isSelfEvent() {
+              return false;
+            }
+          };
+        case ADD_PARTITION:
+          return new AddPartitionEvent(catalogOpExecutor_, metrics, event) {
+            @Override
+            public boolean isSelfEvent() {
+              return false;
+            }
+          };
+        case ALTER_PARTITION:
+          return new AlterPartitionEvent(catalogOpExecutor_, metrics, event) {
+            @Override
+            public boolean isSelfEvent() {
+              return false;
+            }
+          };
+        case DROP_PARTITION:
+          return new DropPartitionEvent(catalogOpExecutor_, metrics, event) {
+            @Override
+            public boolean isSelfEvent() {
+              return false;
+            }
+          };
+        case INSERT:
+          return new InsertEvent(catalogOpExecutor_, metrics, event) {
+            @Override
+            public boolean isSelfEvent() {
+              return false;
+            }
+          };
+        default:
+          return super.get(event, metrics);
+      }
+    }
+  }
+
 
   /**
    * Abstract base class for all MetastoreEvents. A MetastoreEvent is a object used to
@@ -400,6 +477,12 @@ public class MetastoreEvents {
             .getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).getCount());
         return;
       }
+      if (BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls()) {
+        if (shouldSkipWhenSyncingToLatestEventId()) {
+          metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+          return;
+        }
+      }
       process();
     }
 
@@ -441,6 +524,18 @@ public class MetastoreEvents {
      * field which is used for logging purposes.
      */
     protected MetastoreEventType getBatchEventType() { return null; }
+
+    /**
+     * Evaluates whether processing of this event should be skipped
+     * if sync to latest event id is enabled. The event should
+     * be skipped if the db/table is already synced atleast till
+     * this event.
+     * @return true if the event should be skipped. False
+     *          otherwise
+     * @throws CatalogException
+     */
+    protected abstract boolean shouldSkipWhenSyncingToLatestEventId()
+        throws CatalogException;
 
     /**
      * Process the information available in the NotificationEvent to take appropriate
@@ -563,6 +658,8 @@ public class MetastoreEvents {
      * Returns false if the version numbers or service id don't match
      */
     protected boolean isSelfEvent() {
+      // TODO: If an event is a self event, shall we set the last synced event id
+      // for db/table to the given event id before skipping event processing?
       try {
         if (catalog_.evaluateSelfEvent(getSelfEventContext())) {
           metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
@@ -577,6 +674,17 @@ public class MetastoreEvents {
             e.getMessage());
       }
       return false;
+    }
+
+    public final boolean isDropEvent() {
+      return (this instanceof DropTableEvent ||
+          this instanceof DropDatabaseEvent ||
+          this instanceof DropPartitionEvent);
+    }
+
+    @Override
+    public String toString() {
+      return String.format(STR_FORMAT_EVENT_ID_TYPE, eventId_, eventType_);
     }
   }
 
@@ -698,7 +806,7 @@ public class MetastoreEvents {
         throws CatalogException {
       try {
         if (!catalog_.reloadTableIfExists(dbName_, tblName_,
-            "Processing " + operation + " event from HMS")) {
+            "Processing " + operation + " event from HMS", getEventId())) {
           debugLog("Automatic refresh on table {} failed as the table "
               + "either does not exist anymore or is not in loaded state.",
               getFullyQualifiedTblName());
@@ -743,6 +851,74 @@ public class MetastoreEvents {
             getFullyQualifiedTblName());
       }
     }
+
+    /**
+     * Helper method used by shouldSkipWhenSyncingToLatestEventId to decide whether
+     * to skip processing this event or not.
+     * Child class is not supposed to override this logic. It can however
+     * override shouldSkipWhenSyncingToLatestEventId() for custom logic
+     */
+    protected final boolean shouldSkipHelper(String dbName, String tblName)
+        throws CatalogException {
+      Preconditions.checkState(
+          BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls(),
+          "sync to latest event flag is not set");
+      long eventId = this.getEventId();
+      Preconditions.checkState(eventId > 0,
+          "Invalid event id %s. Should be greater than "
+              + "0", eventId);
+      org.apache.impala.catalog.Table tbl = null;
+      try {
+        tbl = catalog_.getTable(dbName, tblName);
+        if (tbl == null) {
+          infoLog("Skipping on table {}.{} since it does not exist in cache", dbName,
+              tblName);
+          return true;
+        }
+        // During alter table rename, the renamed table is created as Incomplete table
+        // with create event id set to alter_table event id (i.e not -1) and therefore
+        // should *NOT* be skipped in event processing
+        if (tbl instanceof IncompleteTable && tbl.getLastSyncedEventId() == -1) {
+          infoLog("Skipping on an incomplete table {} since last synced event id is "
+                  + "set to {}", tbl.getFullName(), tbl.getLastSyncedEventId());
+          return true;
+        }
+      } catch (DatabaseNotFoundException e) {
+        infoLog("Skipping on table {} because db {} not found in cache", tblName,
+            dbName);
+        return true;
+      }
+      boolean shouldSkip = false;
+      // acquire readlock on table
+      if (!catalog_.tryLock(tbl, false, catalog_.LOCK_RETRY_TIMEOUT_MS)) {
+        throw new CatalogException(
+            String.format("Couldn't acquire readlock on table %s even after %s ms",
+                tbl.getFullName(), catalog_.LOCK_RETRY_TIMEOUT_MS));
+      }
+      catalog_.getLock().writeLock().unlock();
+      if (tbl.getLastSyncedEventId() >= eventId) {
+        infoLog("Skipping on table {} since it is already synced till event id {}",
+            tbl.getFullName(), tbl.getLastSyncedEventId());
+        shouldSkip = true;
+      }
+      tbl.releaseReadLock();
+      return shouldSkip;
+    }
+
+    /**
+     * To decide whether to skip processing this event, fetch table from cache
+     * and compare the last synced event id of cache table with this event id.
+     * Skip this event if the table is already synced till this event id. Otherwise
+     * process this event.
+     * @return
+     * @throws CatalogException
+     */
+    protected boolean shouldSkipWhenSyncingToLatestEventId() throws CatalogException {
+      Preconditions.checkState(
+          BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls(),
+          "sync to latest event flag is not set to true");
+      return shouldSkipHelper(dbName_, tblName_);
+    }
   }
 
   /**
@@ -768,6 +944,10 @@ public class MetastoreEvents {
      */
     @Override
     protected boolean isEventProcessingDisabled() {
+      return false;
+    }
+
+    protected boolean shouldSkipWhenSyncingToLatestEventId() throws CatalogException {
       return false;
     }
   }
@@ -871,6 +1051,10 @@ public class MetastoreEvents {
 
     public Table getTable() {
       return msTbl_;
+    }
+
+    protected boolean shouldSkipWhenSyncingToLatestEventId() {
+      return false;
     }
   }
 
@@ -1021,7 +1205,7 @@ public class MetastoreEvents {
     // the table object after alter operation, as parsed from the NotificationEvent
     protected org.apache.hadoop.hive.metastore.api.Table tableAfter_;
     // true if this alter event was due to a rename operation
-    private final boolean isRename_;
+    protected final boolean isRename_;
     // value of event sync flag for this table before the alter operation
     private final Boolean eventSyncBeforeFlag_;
     // value of the event sync flag if available at this table after the alter operation
@@ -1091,6 +1275,31 @@ public class MetastoreEvents {
             .getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).getCount());
       }
     }
+
+    /**
+     * If the alter table event is generated because of table rename then event
+     * should *NOT* be skipped if old table is not synced this till event AND
+     * new table doesn't exist in cache. Skip otherwise
+     * @return true if event should be skipped. false otherwise
+     * @throws CatalogException
+     */
+    protected boolean shouldSkipWhenSyncingToLatestEventId() throws CatalogException {
+      // always process rename since renameTableFromEvent will make sure that
+      // the old table was removed and new was added
+      return isRename_ ? false : super.shouldSkipWhenSyncingToLatestEventId();
+      /*
+      if (!isRename_) {
+        return super.shouldSkipWhenSyncingToLatestEventId();
+      }
+      if(!shouldSkipHelper(tableBefore_.getDbName(), tableBefore_.getTableName()) &&
+          shouldSkipHelper(tableAfter_.getDbName(), tableAfter_.getTableName())) {
+        return false;
+      }
+      return true;
+
+       */
+    }
+
     /**
      * If the ALTER_TABLE event is due a table rename, this method removes the old table
      * and creates a new table with the new name. Else, this just issues a refresh
@@ -1102,6 +1311,7 @@ public class MetastoreEvents {
         processRename();
         return;
       }
+
       // Determine whether this is an event which we have already seen or if it is a new
       // event
       if (isSelfEvent()) {
@@ -1363,19 +1573,51 @@ public class MetastoreEvents {
       }
       Preconditions.checkNotNull(alteredDatabase_);
       // If not self event, copy Db object from event to catalog
-      if (!catalog_.updateDbIfExists(alteredDatabase_)) {
+      if (!catalogOpExecutor_.alterDbIfExists(getEventId(), alteredDatabase_)) {
         // Okay to skip this event. Events processor will not error out.
         debugLog("Update database {} failed as the database is not present in the "
             + "catalog.", alteredDatabase_.getName());
       } else {
-        infoLog("Database {} updated after alter database event.",
-            alteredDatabase_.getName());
+        infoLog("Database {} updated after alter database event id {}",
+            alteredDatabase_.getName(), getEventId());
       }
     }
 
     @Override
     protected SelfEventContext getSelfEventContext() {
       return new SelfEventContext(dbName_, null, alteredDatabase_.getParameters());
+    }
+
+    /**
+     * Skip processing this event if either db does not exist in cache or is already
+     * synced atleast to this event id.
+     * @return
+     * @throws CatalogException
+     */
+    @Override
+    protected boolean shouldSkipWhenSyncingToLatestEventId() throws CatalogException {
+      Preconditions.checkState(
+          BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls(),
+          "sync to latest event id flag should be set");
+      long eventId = this.getEventId();
+      Db db = catalog_.getDb(getDbName());
+      if (db == null) {
+        infoLog("Skipping since db {} does not exist in cache", getDbName());
+        return true;
+      }
+      if (!catalog_.tryLockDb(db)) {
+        throw new CatalogException(String.format("Couldn't acquire lock on db %s",
+            db.getName()));
+      }
+      catalog_.getLock().writeLock().unlock();
+      boolean shouldSkip = false;
+      if (db.getLastSyncedEventId() >= eventId) {
+        infoLog("Skipping on db {} since db is already synced till event id {}",
+            getDbName(), db.getLastSyncedEventId());
+        shouldSkip = true;
+      }
+      db.getLock().unlock();
+      return shouldSkip;
     }
   }
 
@@ -1415,6 +1657,11 @@ public class MetastoreEvents {
     public SelfEventContext getSelfEventContext() {
       throw new UnsupportedOperationException("Self-event evaluation is not needed for "
           + "this event");
+    }
+
+    @Override
+    protected boolean shouldSkipWhenSyncingToLatestEventId() {
+      return false;
     }
 
     /**
@@ -1958,6 +2205,11 @@ public class MetastoreEvents {
 
     @Override
     protected boolean isEventProcessingDisabled() {
+      return false;
+    }
+
+    @Override
+    protected boolean shouldSkipWhenSyncingToLatestEventId() {
       return false;
     }
 

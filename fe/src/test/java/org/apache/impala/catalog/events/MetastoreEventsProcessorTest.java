@@ -76,12 +76,12 @@ import org.apache.impala.catalog.DatabaseNotFoundException;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.FeCatalogUtils;
 import org.apache.impala.catalog.FeFsPartition;
-import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.HdfsPartition;
 import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.IncompleteTable;
 import org.apache.impala.catalog.MetaStoreClientPool;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.catalog.MetastoreApiTestUtils;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
@@ -99,6 +99,7 @@ import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.testutil.CatalogServiceTestCatalog;
@@ -177,16 +178,14 @@ import org.mockito.Mockito;
 public class MetastoreEventsProcessorTest {
   private static final String TEST_DB_NAME = "events_test_db";
 
-  private static CatalogServiceCatalog catalog_;
+  private static CatalogServiceTestCatalog catalog_;
   private static CatalogOpExecutor catalogOpExecutor_;
   private static MetastoreEventsProcessor eventsProcessor_;
 
   @BeforeClass
   public static void setUpTestEnvironment() throws TException, ImpalaException {
     catalog_ = CatalogServiceTestCatalog.create();
-    catalogOpExecutor_ = new CatalogOpExecutor(catalog_,
-        new NoopAuthorizationFactory().getAuthorizationConfig(),
-        new NoopAuthorizationManager());
+    catalogOpExecutor_ = catalog_.getCatalogOpExecutor();
     try (MetaStoreClient metaStoreClient = catalog_.getMetaStoreClient()) {
       CurrentNotificationEventId currentNotificationId =
           metaStoreClient.getHiveClient().getCurrentNotificationEventId();
@@ -302,6 +301,7 @@ public class MetastoreEventsProcessorTest {
     createDatabaseFromImpala(TEST_DB_NAME, null);
     createTableFromImpala(TEST_DB_NAME, "testNextMetastoreEvents1", false);
     createTable("testNextMetastoreEvents2", false);
+
     List<NotificationEvent> events = MetastoreEventsProcessor.getNextMetastoreEvents(
         eventsProcessor_.catalog_, currentEventId, null, 2);
     assertEquals(3, events.size());
@@ -374,7 +374,8 @@ public class MetastoreEventsProcessorTest {
       // create a database and table in the custom hive catalog whose name matches
       // with one already existing in Impala
       createDatabase(catName, TEST_DB_NAME, null);
-      createTable(catName, TEST_DB_NAME, tblName, null, false);
+      createTable(catName, TEST_DB_NAME,
+          tblName, null, false);
       eventsProcessor_.processEvents();
       assertEquals(EventProcessorStatus.ACTIVE, eventsProcessor_.getStatus());
       // assert that dbname and table in the default catalog exist
@@ -424,6 +425,7 @@ public class MetastoreEventsProcessorTest {
     String tblToBeDropped = "tbl_to_be_dropped";
     createTable(tblToBeDropped, true);
     createTable("tbl_to_be_dropped_unpartitioned", false);
+
     // create 2 partitions
     List<List<String>> partVals = new ArrayList<>(2);
     partVals.add(Arrays.asList("1"));
@@ -600,6 +602,7 @@ public class MetastoreEventsProcessorTest {
         catalog_.getTable(TEST_DB_NAME, testTblName));
     // create a non-partitioned table
     createTable(testTblName, false);
+
     eventsProcessor_.processEvents();
     assertNotNull("Catalog should have a incomplete instance of table after CREATE_TABLE "
             + "event is received",
@@ -610,6 +613,7 @@ public class MetastoreEventsProcessorTest {
     // test partitioned table case
     final String testPartitionedTbl = "testCreateTableEventPartitioned";
     createTable(testPartitionedTbl, true);
+
     eventsProcessor_.processEvents();
     assertNotNull("Catalog should have create a incomplete table after receiving "
             + "CREATE_TABLE event",
@@ -624,6 +628,7 @@ public class MetastoreEventsProcessorTest {
     createDatabaseFromImpala(TEST_DB_NAME, null);
     eventsProcessor_.processEvents();
     createTable("createondroppeddb", false);
+
     dropDatabaseCascadeFromImpala(TEST_DB_NAME);
     eventsProcessor_.processEvents();
     assertEquals(EventProcessorStatus.ACTIVE, eventsProcessor_.getStatus());
@@ -723,6 +728,40 @@ public class MetastoreEventsProcessorTest {
     String tableToInsertNoPart = "tbl_to_insert_no_part";
     createTable(TEST_DB_NAME, tableToInsertNoPart, false);
     testInsertEvents(TEST_DB_NAME, tableToInsertNoPart,false);
+  }
+
+  /**
+   * The test asserts that partitioned table is synced till
+   * latest event id when processing an insert event
+   * @throws Exception
+   */
+  @Test
+  public void testInsertEventSyncToLatestEventId() throws Exception {
+    // Test insert into partition
+    boolean prevFlagVal = BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls();
+    boolean invalidateHMSFlag = BackendConfig.INSTANCE.invalidateCatalogdHMSCacheOnDDLs();
+    try {
+      BackendConfig.INSTANCE.setEnableSyncToLatestEventOnDdls(true);
+      BackendConfig.INSTANCE.setInvalidateCatalogdHMSCacheOnDDLs(false);
+      createDatabase(TEST_DB_NAME, null);
+      String tableToInsertPart = "tbl_to_insert_part_sync_to_latest_event_id";
+      createTable(TEST_DB_NAME, tableToInsertPart, true);
+      testInsertEvents(TEST_DB_NAME, tableToInsertPart, true);
+      Table tbl = catalog_.getTable(TEST_DB_NAME, tableToInsertPart);
+      long currentEventIdHms = -1;
+      try (MetaStoreClient metaStoreClient = catalog_.getMetaStoreClient()) {
+        currentEventIdHms =
+            metaStoreClient.getHiveClient().getCurrentNotificationEventId().getEventId();
+      }
+      assertTrue(String.format("current event id in HMS %s differs from table %s last "
+              + "synced event id: %s", currentEventIdHms, tbl.getFullName(),
+              tbl.getLastSyncedEventId()),
+          tbl.getLastSyncedEventId() == currentEventIdHms);
+    } finally {
+      BackendConfig.INSTANCE.setEnableSyncToLatestEventOnDdls(prevFlagVal);
+      BackendConfig.INSTANCE.setInvalidateCatalogdHMSCacheOnDDLs(invalidateHMSFlag);
+    }
+    // TODO: Add test for unpartitioned table as well
   }
 
   /**
@@ -1306,10 +1345,8 @@ public class MetastoreEventsProcessorTest {
    */
   @Test
   public void testEventProcessorFetchAfterHMSRestart() throws ImpalaException {
-    CatalogServiceCatalog catalog = CatalogServiceTestCatalog.create();
-    CatalogOpExecutor catalogOpExecutor = new CatalogOpExecutor(catalog,
-        new NoopAuthorizationFactory().getAuthorizationConfig(),
-        new NoopAuthorizationManager());
+    CatalogServiceTestCatalog catalog = CatalogServiceTestCatalog.create();
+    CatalogOpExecutor catalogOpExecutor = catalog.getCatalogOpExecutor();
     MetastoreEventsProcessor fetchProcessor =
         new HMSFetchNotificationsEventProcessor(catalogOpExecutor,
             eventsProcessor_.getCurrentEventId(), 2L);
@@ -1576,7 +1613,12 @@ public class MetastoreEventsProcessorTest {
             MetastoreEventPropertyKey.DISABLE_EVENT_HMS_SYNC.getKey(),
             tblTransition.second);
         eventsProcessor_.processEvents();
-        assertEquals(EventProcessorStatus.NEEDS_INVALIDATE, eventsProcessor_.getStatus());
+        // if sync to latest event id is enabled, then the event is skipped
+        // since table does not exist in cache
+        if (!BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls()) {
+          assertEquals(EventProcessorStatus.NEEDS_INVALIDATE,
+              eventsProcessor_.getStatus());
+        }
         // issue a catalog reset to make sure that table comes back again and event
         // processing is active
         catalog_.reset();
@@ -1695,9 +1737,9 @@ public class MetastoreEventsProcessorTest {
     }
 
     org.apache.hadoop.hive.metastore.api.Table tableBefore =
-        getTestTable(null, dbName, tblName, beforeParams, false);
+        MetastoreApiTestUtils.getTestTable(null, dbName, tblName, beforeParams, false);
     org.apache.hadoop.hive.metastore.api.Table tableAfter =
-        getTestTable(null, dbName, tblName, afterParams, false);
+        MetastoreApiTestUtils.getTestTable(null, dbName, tblName, afterParams, false);
 
     Map<String, String> dbParams = new HashMap<>(1);
     if (dbFlag != null) {
@@ -1721,7 +1763,7 @@ public class MetastoreEventsProcessorTest {
     // issue a dummy alter table by adding a param
     afterParams.put("dummy", "value");
     org.apache.hadoop.hive.metastore.api.Table nextTable =
-        getTestTable(null, dbName, tblName, afterParams, false);
+        MetastoreApiTestUtils.getTestTable(null, dbName, tblName, afterParams, false);
     NotificationEvent nextNotification =
         createFakeAlterTableNotification(dbName, tblName, tableAfter, nextTable);
     alterTableEvent =
@@ -1785,6 +1827,7 @@ public class MetastoreEventsProcessorTest {
     createTable(null, TEST_DB_NAME, "tbl_should_skipped", tblParams, true);
     // event 3
     createTable(null, TEST_DB_NAME, testTblName, null, true);
+
     List<List<String>> partitionVals = new ArrayList<>();
     partitionVals.add(Arrays.asList("1"));
     partitionVals.add(Arrays.asList("2"));
@@ -1846,7 +1889,7 @@ public class MetastoreEventsProcessorTest {
    */
   @Test
   public void testEventMetricsWhenNotConfigured() {
-    CatalogServiceCatalog testCatalog = CatalogServiceTestCatalog.create();
+    CatalogServiceTestCatalog testCatalog = CatalogServiceTestCatalog.create();
     assertTrue("Events processed is not expected to be configured for this test",
         testCatalog.getMetastoreEventProcessor() instanceof NoOpEventProcessor);
     TEventProcessorMetrics response = testCatalog.getEventProcessorMetrics();
@@ -2298,7 +2341,8 @@ public class MetastoreEventsProcessorTest {
       List<MetastoreEvent> mockEvents = createMockEvents(100, 10,
           eventType, TEST_DB_NAME, testTblName, eventMessage);
       MetastoreEventFactory eventFactory = eventsProcessor_.getEventsFactory();
-      List<MetastoreEvent> batch = eventFactory.createBatchEvents(mockEvents);
+      List<MetastoreEvent> batch = eventFactory.createBatchEvents(mockEvents,
+          eventsProcessor_.getMetrics());
       assertEquals(1, batch.size());
       assertTrue(batch.get(0) instanceof BatchPartitionEvent);
       BatchPartitionEvent batchEvent = (BatchPartitionEvent) batch.get(0);
@@ -2318,7 +2362,7 @@ public class MetastoreEventsProcessorTest {
       mockEvents.addAll(createMockEvents(22, 3,
           eventType, TEST_DB_NAME, testTblName, eventMessage));
 
-      batch = eventFactory.createBatchEvents(mockEvents);
+      batch = eventFactory.createBatchEvents(mockEvents, eventsProcessor_.getMetrics());
       assertEquals(4, batch.size());
       MetastoreEvent batch1 = batch.get(0);
       assertEquals(3, ((BatchPartitionEvent) batch1).getBatchEvents().size());
@@ -2339,7 +2383,8 @@ public class MetastoreEventsProcessorTest {
       mockEvents.addAll(createMockEvents(101, 1, eventType, "db1",
           testTblName, eventMessage));
 
-      List<MetastoreEvent> batchEvents = eventFactory.createBatchEvents(mockEvents);
+      List<MetastoreEvent> batchEvents = eventFactory.createBatchEvents(mockEvents,
+          eventsProcessor_.getMetrics());
       assertEquals(2, batchEvents.size());
       for (MetastoreEvent event : batchEvents) {
         if (eventType.equalsIgnoreCase("ALTER_PARTITION")) {
@@ -2354,7 +2399,7 @@ public class MetastoreEventsProcessorTest {
           testTblName, eventMessage);
       mockEvents.addAll(createMockEvents(101, 1, eventType, TEST_DB_NAME,
           "testtbl", eventMessage));
-      batchEvents = eventFactory.createBatchEvents(mockEvents);
+      batchEvents = eventFactory.createBatchEvents(mockEvents, eventsProcessor_.getMetrics());
       assertEquals(2, batchEvents.size());
       for (MetastoreEvent event : batchEvents) {
         if (eventType.equalsIgnoreCase("ALTER_PARTITION")) {
@@ -2392,7 +2437,7 @@ public class MetastoreEventsProcessorTest {
         createMockEvents(startEventId + mockEvents.size(), 5, "ALTER_PARTITION",
             TEST_DB_NAME, testTblName, eventTypeToMessage.get("ALTER_PARTITION")));
     List<MetastoreEvent> batchedEvents = eventsProcessor_.getEventsFactory()
-        .createBatchEvents(mockEvents);
+        .createBatchEvents(mockEvents, eventsProcessor_.getMetrics());
     assertEquals(7, batchedEvents.size());
     // batch 1 should contain 3 AlterPartitionEvent
     BatchPartitionEvent<AlterPartitionEvent> batch1 = (BatchPartitionEvent
@@ -2439,7 +2484,8 @@ public class MetastoreEventsProcessorTest {
     }
     List<MetastoreEvent> metastoreEvents = new ArrayList<>();
     for (NotificationEvent notificationEvent : mockEvents) {
-      metastoreEvents.add(eventsProcessor_.getEventsFactory().get(notificationEvent));
+      metastoreEvents.add(eventsProcessor_.getEventsFactory().get(notificationEvent,
+          eventsProcessor_.getMetrics()));
     }
     return metastoreEvents;
   }
@@ -2642,25 +2688,16 @@ public class MetastoreEventsProcessorTest {
         catalog_.getHdfsPartition(TEST_DB_NAME, testTblName, partKeyVals2));
   }
 
+  private void createDatabase(String catName, String dbName,
+      Map<String, String> params) throws TException {
+    try(MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+      MetastoreApiTestUtils.createDatabase(msClient, catName, dbName, params);
+    }
+  }
+
   private void createDatabase(String dbName, Map<String, String> params)
       throws TException {
     createDatabase(null, dbName, params);
-  }
-
-  private void createDatabase(String catName, String dbName, Map<String, String> params)
-      throws TException {
-    Database database = new Database();
-    if (catName != null) database.setCatalogName(catName);
-    database.setName(dbName);
-    database.setDescription("Notification test database");
-    database.setOwnerName("NotificationOwner");
-    database.setOwnerType(PrincipalType.USER);
-    if (params != null && !params.isEmpty()) {
-      database.setParameters(params);
-    }
-    try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
-      msClient.getHiveClient().createDatabase(database);
-    }
   }
 
   private void createHiveCatalog(String catName) throws TException {
@@ -2686,11 +2723,7 @@ public class MetastoreEventsProcessorTest {
 
   private void addDatabaseParameters(String key, String val) throws TException {
     try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
-      Database msDb = msClient.getHiveClient().getDatabase(TEST_DB_NAME);
-      assertFalse(key + " already exists in the database parameters",
-          msDb.getParameters().containsKey(key));
-      msDb.putToParameters(key, val);
-      msClient.getHiveClient().alterDatabase(TEST_DB_NAME, msDb);
+      MetastoreApiTestUtils.addDatabaseParametersInHms(msClient, TEST_DB_NAME, key, val);
     }
   }
 
@@ -2701,48 +2734,13 @@ public class MetastoreEventsProcessorTest {
     }
   }
 
-  private void createTable(String catName, String dbName, String tblName,
-      Map<String, String> params, boolean isPartitioned) throws TException {
-    org.apache.hadoop.hive.metastore.api.Table
-        tbl = getTestTable(catName, dbName, tblName, params, isPartitioned);
-
-    try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
-      msClient.getHiveClient().createTable(tbl);
+  private void createTable(String catName, String dbName,
+      String tblName, Map<String, String> params, boolean isPartitioned)
+      throws TException {
+    try(MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+      MetastoreApiTestUtils.createTable(msClient, catName, dbName, tblName, params,
+          isPartitioned);
     }
-  }
-
-  private org.apache.hadoop.hive.metastore.api.Table getTestTable(String catName,
-      String dbName, String tblName, Map<String, String> params, boolean isPartitioned)
-      throws MetaException {
-    org.apache.hadoop.hive.metastore.api.Table tbl =
-        new org.apache.hadoop.hive.metastore.api.Table();
-    if (catName != null) tbl.setCatName(catName);
-    tbl.setDbName(dbName);
-    tbl.setTableName(tblName);
-    tbl.putToParameters("tblParamKey", "tblParamValue");
-    List<FieldSchema> cols = Lists.newArrayList(
-        new FieldSchema("c1","string","c1 description"),
-        new FieldSchema("c2", "string","c2 description"));
-
-    StorageDescriptor sd = new StorageDescriptor();
-    sd.setCols(cols);
-    sd.setInputFormat(HdfsFileFormat.PARQUET.inputFormat());
-    sd.setOutputFormat(HdfsFileFormat.PARQUET.outputFormat());
-
-    SerDeInfo serDeInfo = new SerDeInfo();
-    serDeInfo.setSerializationLib(HdfsFileFormat.PARQUET.serializationLib());
-    sd.setSerdeInfo(serDeInfo);
-    tbl.setSd(sd);
-
-    if (params != null && !params.isEmpty()) {
-      tbl.setParameters(params);
-    }
-    if (isPartitioned) {
-      List<FieldSchema> pcols = Lists.newArrayList(
-          new FieldSchema("p1","string","partition p1 description"));
-      tbl.setPartitionKeys(pcols);
-    }
-    return tbl;
   }
 
   /**
@@ -2761,15 +2759,20 @@ public class MetastoreEventsProcessorTest {
   /**
    * Creates db from Impala
    */
-  private void createDatabaseFromImpala(String dbName, String desc)
-      throws ImpalaException {
+  public static void createDatabaseFromImpala(CatalogOpExecutor catalogOpExecutor,
+      String dbName, String desc) throws ImpalaException {
     TDdlExecRequest req = new TDdlExecRequest();
     req.setDdl_type(TDdlType.CREATE_DATABASE);
     TCreateDbParams createDbParams = new TCreateDbParams();
     createDbParams.setDb(dbName);
     createDbParams.setComment(desc);
     req.setCreate_db_params(createDbParams);
-    catalogOpExecutor_.execDdlRequest(req);
+    catalogOpExecutor.execDdlRequest(req);
+  }
+
+  private void createDatabaseFromImpala(String dbName, String desc)
+      throws ImpalaException {
+    createDatabaseFromImpala(catalogOpExecutor_, dbName, desc);
   }
 
   /**
@@ -2825,8 +2828,8 @@ public class MetastoreEventsProcessorTest {
    * Creates a table using CatalogOpExecutor to simulate a DDL operation from Impala
    * client
    */
-  private void createTableFromImpala(String dbName, String tblName,
-      Map<String, String> tblParams, boolean isPartitioned)
+  public static void createTableFromImpala(CatalogOpExecutor opExecutor, String dbName,
+      String tblName, Map<String, String> tblParams, boolean isPartitioned)
       throws ImpalaException {
     TDdlExecRequest req = new TDdlExecRequest();
     req.setDdl_type(TDdlType.CREATE_TABLE);
@@ -2850,7 +2853,12 @@ public class MetastoreEventsProcessorTest {
       createTableParams.setPartition_columns(partitionColumns);
     }
     req.setCreate_table_params(createTableParams);
-    catalogOpExecutor_.execDdlRequest(req);
+    opExecutor.execDdlRequest(req);
+  }
+
+  private void createTableFromImpala(String dbName, String tblName,
+      Map<String, String> tblParams, boolean isPartitioned) throws ImpalaException {
+    createTableFromImpala(catalogOpExecutor_, dbName, tblName, tblParams, isPartitioned);
   }
 
   /**
@@ -3208,7 +3216,7 @@ public class MetastoreEventsProcessorTest {
     return tUpdateCatalogRequest;
   }
 
-  private TColumn getScalarColumn(String colName, TPrimitiveType type) {
+  private static TColumn getScalarColumn(String colName, TPrimitiveType type) {
     TTypeNode tTypeNode = new TTypeNode(TTypeNodeType.SCALAR);
     tTypeNode.setScalar_type(new TScalarType(type));
     TColumnType columnType = new TColumnType(Arrays.asList(tTypeNode));
@@ -3228,12 +3236,13 @@ public class MetastoreEventsProcessorTest {
     return partitionDef;
   }
 
-  private void createTable(String dbName, String tblName, boolean isPartitioned)
-      throws TException {
+  private void createTable(String dbName, String tblName,
+      boolean isPartitioned) throws TException {
     createTable(null, dbName, tblName, null, isPartitioned);
   }
 
-  private void createTable(String tblName, boolean isPartitioned) throws TException {
+  private void createTable(String tblName, boolean isPartitioned)
+      throws TException {
     createTable(null, TEST_DB_NAME, tblName, null, isPartitioned);
   }
 
@@ -3403,22 +3412,8 @@ public class MetastoreEventsProcessorTest {
   private void addPartitions(String dbName, String tblName,
       List<List<String>> partitionValues)
       throws TException {
-    int i = 0;
-    List<Partition> partitions = new ArrayList<>(partitionValues.size());
-    try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
-      org.apache.hadoop.hive.metastore.api.Table msTable =
-          msClient.getHiveClient().getTable(dbName, tblName);
-      for (List<String> partVals : partitionValues) {
-        Partition partition = new Partition();
-        partition.setDbName(msTable.getDbName());
-        partition.setTableName(msTable.getTableName());
-        partition.setSd(msTable.getSd().deepCopy());
-        partition.setValues(partVals);
-        partitions.add(partition);
-      }
-    }
-    try (MetaStoreClient metaStoreClient = catalog_.getMetaStoreClient()) {
-      metaStoreClient.getHiveClient().add_partitions(partitions);
+    try(MetaStoreClient client = catalog_.getMetaStoreClient()) {
+      MetastoreApiTestUtils.addPartitions(client, dbName, tblName, partitionValues);
     }
   }
 

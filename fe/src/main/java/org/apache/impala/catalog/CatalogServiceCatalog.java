@@ -60,7 +60,10 @@ import org.apache.impala.authorization.AuthorizationPolicy;
 import org.apache.impala.catalog.FeFsTable.Utils;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.catalog.events.EventFactory;
 import org.apache.impala.catalog.events.ExternalEventsProcessor;
+import org.apache.impala.catalog.events.MetastoreEvents.EventFactoryForSyncToLatestEvent;
+import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEventFactory;
 import org.apache.impala.catalog.events.MetastoreEventsProcessor;
 import org.apache.impala.catalog.events.MetastoreEventsProcessor.EventProcessorStatus;
 import org.apache.impala.catalog.events.SelfEventContext;
@@ -218,7 +221,7 @@ public class CatalogServiceCatalog extends Catalog {
   //value of timeout for the topic update thread while waiting on the table lock.
   private final long topicUpdateTblLockMaxWaitTimeMs_;
   //Default value of timeout for acquiring a table lock.
-  private static final long LOCK_RETRY_TIMEOUT_MS = 7200000;
+  public static final long LOCK_RETRY_TIMEOUT_MS = 7200000;
   // Time to sleep before retrying to acquire a table lock
   private static final int LOCK_RETRY_DELAY_MS = 10;
   // default value of table id in the GetPartialCatalogObjectRequest
@@ -282,6 +285,7 @@ public class CatalogServiceCatalog extends Catalog {
 
   private ICatalogMetastoreServer catalogMetastoreServer_;
 
+  private MetastoreEventFactory syncToLatestEventFactory_;
   /**
    * See the gflag definition in be/.../catalog-server.cc for details on these modes.
    */
@@ -309,7 +313,6 @@ public class CatalogServiceCatalog extends Catalog {
   private final Set<String> blacklistedDbs_;
   // Tables that will be skipped in loading.
   private final Set<TableName> blacklistedTables_;
-
   /**
    * Initialize the CatalogServiceCatalog using a given MetastoreClientPool impl.
    *
@@ -362,6 +365,7 @@ public class CatalogServiceCatalog extends Catalog {
         "Start events processor called before initializing it");
     metastoreEventProcessor_.start();
   }
+
 
   /**
    * Initializes the Catalog using the default MetastoreClientPool impl.
@@ -421,6 +425,65 @@ public class CatalogServiceCatalog extends Catalog {
    */
   public boolean tryWriteLock(Table tbl) {
     return tryLock(tbl, true, LOCK_RETRY_TIMEOUT_MS);
+  }
+
+  /**
+   * Acquire write lock on multiple tables. If the lock couldn't be acquired on any
+   * table, then release the table lock as well as version lock held due previous tables
+   * and return false.
+   * If write locks were acquired on all tables then release version lock
+   * on all tables except last one before returning true. In case of success, it is
+   * caller's responsibility to release versionLock's writeLock
+   * @param tables: Catalog tables on which write lock has to be acquired
+   * @return true if lock was acquired on all tables successfully. False
+   *         otherwise
+   */
+  public boolean tryWriteLock(Table[] tables) {
+    StringBuilder tableInfo = new StringBuilder();
+    int numTables = tables.length;
+    if (LOG.isDebugEnabled()) {
+      for(int i = 0; i < numTables; i++) {
+        tableInfo.append(tables[i].getFullName());
+        if(i < numTables - 1) {
+          tableInfo.append(", ");
+        }
+      }
+      LOG.debug("Trying to acquire write locks for tables: " +
+          tableInfo);
+    }
+    int tableIndex=-1, versionLockCount = 0;
+    try {
+      for(tableIndex = 0; tableIndex < numTables; tableIndex++) {
+        Table tbl = tables[tableIndex];
+        if (!tryWriteLock(tbl)) {
+          LOG.debug("Could not acquire write lock on table: " + tbl.getFullName());
+          return false;
+        }
+        versionLockCount += 1;
+      }
+      // in case of success, release version write lock for all tables except last
+      if (tableIndex == numTables) {
+        versionLockCount = versionLockCount - 1;
+      }
+      return true;
+    } finally {
+      if (tableIndex != numTables) {
+        // couldn't acquire lock on all tables
+        StringBuilder tablesInfo = new StringBuilder();
+        for(int i = 0; i < tableIndex; i++) {
+          tables[i].releaseWriteLock();
+          tablesInfo.append(tables[i].getFullName() + ((i < tableIndex-1) ? ", " : ""));
+        }
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Released table write lock on tables: {}", tablesInfo);
+        }
+      }
+      LOG.debug("Unlocking versionLock_ write lock {} number of times", versionLockCount);
+      while (versionLockCount > 0) {
+        versionLock_.writeLock().unlock();
+        versionLockCount = versionLockCount - 1;
+      }
+    }
   }
 
   /**
@@ -2099,8 +2162,13 @@ public class CatalogServiceCatalog extends Catalog {
       tbl = getTable(dbName, tblName);
       // tbl doesn't exist in the catalog
       if (tbl == null) return null;
+      LOG.trace("table {} exits in cache, last synced id {}", tbl.getFullName(),
+          tbl.getLastSyncedEventId());
       // if no validWriteIdList is provided, we return the tbl if its loaded
-      if (tbl.isLoaded() && validWriteIdList == null) return tbl;
+      if (tbl.isLoaded() && validWriteIdList == null) {
+        LOG.trace("returning already loaded table {}", tbl.getFullName());
+        return tbl;
+      }
       // if a validWriteIdList is provided, we see if the cached table can provided a
       // consistent view of the given validWriteIdList. If yes, we can return the table
       // otherwise we reload the table. It is possible that the cached table is stale
@@ -2151,6 +2219,7 @@ public class CatalogServiceCatalog extends Catalog {
               .inc();
         }
         previousCatalogVersion = tbl.getCatalogVersion();
+        LOG.trace("Loading full table {}", tbl.getFullName());
         loadReq = tableLoadingMgr_.loadAsync(tableName, tbl.getCreateEventId(), reason);
       }
     } finally {
@@ -2201,8 +2270,12 @@ public class CatalogServiceCatalog extends Catalog {
                  && (!(existingTbl instanceof HdfsTable)
                         || AcidUtils.compare((HdfsTable) existingTbl,
                                updatedTbl.getValidWriteIds(), tableId)
-                            >= 0)))
+                            >= 0))) {
+        LOG.trace("returning existing table {} with last synced id: ",
+            existingTbl.getFullName(), existingTbl.getLastSyncedEventId());
         return existingTbl;
+      }
+
 
       if (existingTbl instanceof HdfsTable) {
         // Add the old instance to the deleteLog_ so we can send isDeleted updates for
@@ -2351,8 +2424,13 @@ public class CatalogServiceCatalog extends Catalog {
    * the result.
    */
   public void reloadTable(Table tbl, String reason) throws CatalogException {
+    reloadTable(tbl, reason, -1);
+  }
+
+  public void reloadTable(Table tbl, String reason, long eventId)
+      throws CatalogException {
     reloadTable(tbl, new TResetMetadataRequest(), CatalogObject.ThriftObjectType.NONE,
-        reason);
+        reason, eventId);
   }
 
   /**
@@ -2366,7 +2444,8 @@ public class CatalogServiceCatalog extends Catalog {
    * if {@code wantMinimalResult} is true, returns the result in the minimal form.
    */
   public TCatalogObject reloadTable(Table tbl, TResetMetadataRequest request,
-      CatalogObject.ThriftObjectType resultType, String reason) throws CatalogException {
+      CatalogObject.ThriftObjectType resultType, String reason, long eventId)
+      throws CatalogException {
     LOG.info(String.format("Refreshing table metadata: %s", tbl.getFullName()));
     Preconditions.checkState(!(tbl instanceof IncompleteTable));
     String dbName = tbl.getDb().getName();
@@ -2375,12 +2454,31 @@ public class CatalogServiceCatalog extends Catalog {
       throw new CatalogException(String.format("Error refreshing metadata for table " +
           "%s due to lock contention", tbl.getFullName()));
     }
+    boolean syncToLatestEventId =
+        BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls();
     final Timer.Context context =
         tbl.getMetrics().getTimer(Table.REFRESH_DURATION_METRIC).time();
     try {
+      if (eventId != -1 && tbl.getLastSyncedEventId() != -1 &&
+          tbl.getLastSyncedEventId() >= eventId) {
+        LOG.info("Not reloading table for event id: {} since table is already synced "
+            + "till event id: {}", eventId, tbl.getLastSyncedEventId());
+        return tbl.toTCatalogObject(resultType);
+      }
+
       long newCatalogVersion = incrementAndGetCatalogVersion();
       versionLock_.writeLock().unlock();
+      long currentHmsEventId = -1;
       try (MetaStoreClient msClient = getMetaStoreClient()) {
+        if (syncToLatestEventId) {
+          try {
+            currentHmsEventId = msClient.getHiveClient().getCurrentNotificationEventId()
+                .getEventId();
+          } catch (TException e) {
+            throw new CatalogException("Failed to reload table: " + tbl.getFullName() +
+                " as there was an error in fetching current event id from HMS", e);
+          }
+        }
         org.apache.hadoop.hive.metastore.api.Table msTbl = null;
         try {
           msTbl = msClient.getHiveClient().getTable(dbName, tblName);
@@ -2395,6 +2493,9 @@ public class CatalogServiceCatalog extends Catalog {
         } else {
           tbl.load(true, msClient.getHiveClient(), msTbl, reason);
         }
+      }
+      if (currentHmsEventId != -1 && syncToLatestEventId) {
+        tbl.setLastSyncedEventId(currentHmsEventId);
       }
       tbl.setCatalogVersion(newCatalogVersion);
       LOG.info(String.format("Refreshed table metadata: %s", tbl.getFullName()));
@@ -2573,12 +2674,14 @@ public class CatalogServiceCatalog extends Catalog {
    * Refresh table if exists. Returns true if reloadTable() succeeds, false
    * otherwise.
    */
-  public boolean reloadTableIfExists(String dbName, String tblName, String reason)
-      throws CatalogException {
+  public boolean reloadTableIfExists(String dbName, String tblName, String reason,
+      long eventId) throws CatalogException {
     try {
       Table table = getTable(dbName, tblName);
       if (table == null || table instanceof IncompleteTable) return false;
-      reloadTable(table, reason);
+      // TODO: If reloadTable succeeds, should we sync table till current HMS
+      // event id since it is a full table reload ?
+      reloadTable(table, reason, eventId);
     } catch (DatabaseNotFoundException | TableLoadingException e) {
       LOG.info(String.format("Reload table if exists failed with: %s", e.getMessage()));
       return false;
@@ -3558,4 +3661,16 @@ public class CatalogServiceCatalog extends Catalog {
   public void setCatalogMetastoreServer(ICatalogMetastoreServer catalogMetastoreServer) {
     this.catalogMetastoreServer_ = catalogMetastoreServer;
   }
+
+  public void setEventFactoryForSyncToLatestEvent(MetastoreEventFactory factory) {
+    Preconditions.checkArgument(factory != null, "factory is null");
+    Preconditions.checkArgument(factory instanceof EventFactoryForSyncToLatestEvent,
+        "factory is not an instance of EventFactorySyncToLatestEvent");
+    this.syncToLatestEventFactory_ = factory;
+  }
+
+  public MetastoreEventFactory getEventFactoryForSyncToLatestEvent() {
+    return syncToLatestEventFactory_;
+  }
+
 }
