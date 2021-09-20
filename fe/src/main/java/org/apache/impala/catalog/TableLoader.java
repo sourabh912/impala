@@ -17,6 +17,7 @@
 
 package org.apache.impala.catalog;
 
+import com.google.common.base.Preconditions;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -25,10 +26,17 @@ import org.apache.hadoop.hive.metastore.IMetaStoreClient.NotificationFilter;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hadoop.hive.metastore.api.NotificationEvent;
+import org.apache.impala.catalog.events.EventFactory;
+import org.apache.impala.catalog.events.MetastoreEvents;
 import org.apache.impala.catalog.events.MetastoreEvents.CreateTableEvent;
+import org.apache.impala.catalog.events.MetastoreEvents.NewMetastoreEventsFactory;
 import org.apache.impala.catalog.events.MetastoreEventsProcessor;
+import org.apache.impala.common.Metrics;
 import org.apache.impala.compat.MetastoreShim;
-import org.apache.log4j.Logger;
+import org.apache.impala.service.BackendConfig;
+import org.apache.impala.service.CatalogOpExecutor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Stopwatch;
 
@@ -41,8 +49,9 @@ import org.apache.thrift.TException;
  * the Hive Metastore / HDFS / etc.
  */
 public class TableLoader {
-  private static final Logger LOG = Logger.getLogger(TableLoader.class);
+  private static final Logger LOG = LoggerFactory.getLogger(TableLoader.class);
 
+  private CatalogOpExecutor catalogOpExecutor_;
   private final CatalogServiceCatalog catalog_;
 
   // Lock used to serialize calls to the Hive MetaStore to work around MetaStore
@@ -50,8 +59,26 @@ public class TableLoader {
   // HIVE-5457.
   private static final Object metastoreAccessLock_ = new Object();
 
-  public TableLoader(CatalogServiceCatalog catalog) {
-    catalog_ = catalog;
+  private EventFactory eventFactory_;
+  public TableLoader(CatalogOpExecutor catalogOpExecutor) {
+    catalog_ = catalogOpExecutor.getCatalog();
+    catalogOpExecutor_ = catalogOpExecutor;
+  }
+
+  /**
+   * Creates thread safe eventFactory which will process HMS events.
+   * Used if sync to latest event id is true
+   * @return
+   */
+  private synchronized EventFactory getEventFactory() {
+    if (eventFactory_ == null) {
+      Preconditions.checkState(catalogOpExecutor_ != null);
+      Metrics metrics = new Metrics();
+      initMetrics(metrics);
+      eventFactory_ =
+          new MetastoreEvents.NewMetastoreEventsFactory(catalogOpExecutor_, metrics);
+    }
+    return eventFactory_;
   }
 
   /**
@@ -68,6 +95,8 @@ public class TableLoader {
     String annotation = "Loading metadata for: " + fullTblName + " (" + reason + ")";
     LOG.info(annotation);
     Table table;
+    boolean syncToLatestEventId =
+        BackendConfig.INSTANCE.enableCatalogdCacheSyncToLatestEventId();
     // turn all exceptions into TableLoadingException
     List<NotificationEvent> events = null;
     try (ThreadNameAnnotator tna = new ThreadNameAnnotator(annotation);
@@ -114,8 +143,29 @@ public class TableLoader {
       }
       table.updateHMSLoadTableSchemaTime(hmsLoadTime);
       table.setCreateEventId(eventId);
+      long latestEventID = -1;
+      if (syncToLatestEventId) {
+        try {
+          latestEventID = msClient.getHiveClient().
+              getCurrentNotificationEventId().getEventId();
+        } catch (TException e) {
+          throw new TableLoadingException("Failed to get latest event id from HMS "
+              + "while loading table: " + table.getFullName(), e);
+        }
+      }
+
       table.load(false, msClient.getHiveClient(), msTbl, reason);
       table.validate();
+      if (syncToLatestEventId) {
+        LOG.debug("After full reload, table {} is synced atleast till event id {}. "
+                + "Checking if there are more events generated for this table "
+                + "while the full reload was in progress",
+            table.getFullName(), latestEventID);
+        table.setLastSyncedEventId(latestEventID);
+        // write lock is not required since it is full table reload
+        MetastoreEventsProcessor.syncToLatestEventId(catalogOpExecutor_, table,
+            getEventFactory(), false);
+      }
     } catch (TableLoadingException e) {
       table = IncompleteTable.createFailedMetadataLoadTable(db, tblName, e);
     } catch (NoSuchObjectException e) {
@@ -134,5 +184,31 @@ public class TableLoader {
     LOG.info("Loaded metadata for: " + fullTblName + " (" +
         sw.elapsed(TimeUnit.MILLISECONDS) + "ms)");
     return table;
+  }
+  private void initMetrics(Metrics metrics) {
+    metrics.addTimer(
+        MetastoreEventsProcessor.EVENTS_FETCH_DURATION_METRIC);
+    metrics.addTimer(
+        MetastoreEventsProcessor.EVENTS_PROCESS_DURATION_METRIC);
+    metrics.addMeter(
+        MetastoreEventsProcessor.EVENTS_RECEIVED_METRIC);
+    metrics.addCounter(
+        MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC);
+    metrics.addCounter(
+        MetastoreEventsProcessor.NUMBER_OF_TABLE_REFRESHES);
+    metrics.addCounter(
+        MetastoreEventsProcessor.NUMBER_OF_PARTITION_REFRESHES);
+    metrics.addCounter(
+        MetastoreEventsProcessor.NUMBER_OF_TABLES_ADDED);
+    metrics.addCounter(
+        MetastoreEventsProcessor.NUMBER_OF_TABLES_REMOVED);
+    metrics.addCounter(
+        MetastoreEventsProcessor.NUMBER_OF_DATABASES_ADDED);
+    metrics.addCounter(
+        MetastoreEventsProcessor.NUMBER_OF_DATABASES_REMOVED);
+    metrics.addCounter(
+        MetastoreEventsProcessor.NUMBER_OF_PARTITIONS_ADDED);
+    metrics.addCounter(
+        MetastoreEventsProcessor.NUMBER_OF_PARTITIONS_REMOVED);
   }
 }

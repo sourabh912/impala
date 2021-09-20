@@ -44,6 +44,8 @@ import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.fb.FbFileBlock;
 import org.apache.thrift.TException;
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class CatalogHmsFileMetadataTest extends AbstractCatalogMetastoreTest {
 
@@ -51,6 +53,7 @@ public class CatalogHmsFileMetadataTest extends AbstractCatalogMetastoreTest {
    * The test fetches partitions of a table over HMS API and then compares if the
    * deserialized filemetadata from the response matches with what we have in catalogd.
    */
+
   @Test
   public void testFileMetadataForPartitions() throws Exception {
     // get partitions from catalog directly

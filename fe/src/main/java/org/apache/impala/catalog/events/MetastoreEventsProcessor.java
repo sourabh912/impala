@@ -39,7 +39,10 @@ import org.apache.hadoop.hive.metastore.api.NotificationEventResponse;
 import org.apache.hadoop.hive.metastore.messaging.MessageDeserializer;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogServiceCatalog;
+import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.IncompleteTable;
 import org.apache.impala.catalog.events.ConfigValidator.ValidationResult;
 import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEvent;
 import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEventFactory;
@@ -52,6 +55,7 @@ import org.apache.impala.thrift.TDdlExecResponse;
 import org.apache.impala.thrift.TEventProcessorMetrics;
 import org.apache.impala.thrift.TEventProcessorMetricsSummaryResponse;
 import org.apache.impala.util.MetaStoreUtil;
+import org.apache.impala.util.ThreadNameAnnotator;
 import org.apache.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -295,6 +299,187 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
       throw new ImpalaRuntimeException(String.format(
           CatalogOpExecutor.HMS_RPC_ERROR_FORMAT_STR, "getNextNotification"), e);
     }
+  }
+
+  public static void syncToLatestEventId(CatalogOpExecutor catalogOpExecutor,
+      org.apache.impala.catalog.Table tbl, EventFactory eventFactory)
+      throws CatalogException, MetastoreNotificationException, ImpalaRuntimeException {
+    syncToLatestEventId(catalogOpExecutor, tbl, eventFactory, true);
+  }
+
+  /**
+   * Sync table to latest event id starting from last synced
+   * event id.
+   * @param catalogOpExecutor
+   * @param tbl: Catalog table to be synced
+   * @param eventFactory
+   * @param shouldBeAlreadyLocked: If true, write lock should already be
+   *                             held by current thread
+   * @throws CatalogException
+   * @throws MetastoreNotificationException
+   * @throws ImpalaRuntimeException
+   */
+  public static void syncToLatestEventId(CatalogOpExecutor catalogOpExecutor,
+      org.apache.impala.catalog.Table tbl, EventFactory eventFactory,
+      boolean shouldBeAlreadyLocked) throws CatalogException,
+      MetastoreNotificationException, ImpalaRuntimeException {
+    Preconditions.checkArgument(tbl != null, "tbl is null");
+    Preconditions.checkState(!(tbl instanceof IncompleteTable) &&
+        tbl.isLoaded());
+    if (shouldBeAlreadyLocked) {
+      Preconditions.checkState(tbl.isWriteLockedByCurrentThread(),
+          String.format("Write lock is not held on table %s by current thread",
+              tbl.getFullName()));
+    }
+    long lastEventId = tbl.getLastSyncedEventId();
+    Preconditions.checkArgument(lastEventId > 0, "lastEvent " +
+        " Id %s for table %s should be greater than 0", lastEventId, tbl.getFullName());
+
+    String annotation = String.format("sync table %s to latest HMS event id",
+        tbl.getFullName());
+    try(ThreadNameAnnotator tna = new ThreadNameAnnotator(annotation)) {
+      List<NotificationEvent> events = getNextMetastoreEvents(
+          catalogOpExecutor.getCatalog(), lastEventId,
+          getTableNotificationEventFilter(tbl));
+
+      if (events.isEmpty()) {
+        LOG.debug("table {} synced till event id {}. No new HMS events to process from "
+                + "event id: {}", tbl.getFullName(), lastEventId,
+            lastEventId + 1);
+        return;
+      }
+      MetastoreEvents.MetastoreEvent currentEvent = null;
+      boolean tableDropped = false;
+      for (NotificationEvent event : events) {
+        currentEvent = eventFactory.get(event);
+      /*
+      TODO:
+       1. Should we stop after processing drop_table
+          event because drop_table event would remove table
+          from cache and subsequent create_table event would add
+          new table object in cache?
+       2. If yes, can table be dropped in a transaction? If so,
+          we would need to process commit/abort txn event after
+          drop_table event to decide whether to drop the table
+          or not.
+          UPDATE: Checked drop_table implementation in
+          catalogOpExecutor and it does acquire standalone
+          lock on transactional tables but drop_table request
+          is *not* in a transaction
+       */
+        currentEvent.processIfEnabled();
+        if (currentEvent.isDropEvent()) {
+          catalogOpExecutor.addToDeleteEventLog(
+              new ArrayList<NotificationEvent>(Arrays.asList(event)));
+        }
+        if (currentEvent instanceof MetastoreEvents.DropTableEvent) {
+          tableDropped = true;
+          break;
+        }
+      }
+      if (tableDropped) {
+        return;
+      }
+      // setting HMS Event ID after all the events
+      // are successfully processed only if table was
+      // not dropped
+      tbl.setLastSyncedEventId(currentEvent.getEventId());
+      LOG.info("Synced table {} till HMS event:  {}", tbl.getFullName(), currentEvent);
+    }
+  }
+
+  /**
+   * Sync database to latest event id starting from the last synced
+   * event id
+   * @param catalogOpExecutor
+   * @param db
+   * @param eventFactory
+   * @throws CatalogException
+   * @throws MetastoreNotificationException
+   * @throws ImpalaRuntimeException
+   */
+  // TODO: Should we throw TException instead of ImpalaRunTimeException
+  public static void syncToLatestEventId(CatalogOpExecutor catalogOpExecutor,
+      org.apache.impala.catalog.Db db, EventFactory eventFactory)
+      throws CatalogException, MetastoreNotificationException,
+      ImpalaRuntimeException{
+    Preconditions.checkArgument(db != null, "db is null");
+    long lastEventId = db.getLastSyncedEventId();
+    Preconditions.checkArgument(lastEventId > 0, "Invalid " +
+        "last synced event ID %s for db %s ", lastEventId, db.getName());
+    Preconditions.checkState(db.isLockHeldByCurrentThread(),
+        "Current thread does not hold lock on db: %s", db.getName());
+
+    String annotation = String.format("sync db %s to latest HMS event id", db.getName());
+    try(ThreadNameAnnotator tna = new ThreadNameAnnotator(annotation)) {
+      List<NotificationEvent> events = getNextMetastoreEvents(
+          catalogOpExecutor.getCatalog(), lastEventId,
+          getDbNotificationEventFilter(db));
+
+      if (events.isEmpty()) {
+        LOG.debug("db {} already synced till event id: {}, no new hms events from "
+            + "event id: {}", db.getName(), lastEventId, lastEventId+1);
+        return;
+      }
+      boolean dbDropped = false;
+      MetastoreEvents.MetastoreEvent currentEvent = null;
+      for (NotificationEvent event : events) {
+        currentEvent = eventFactory.get(event);
+        // TODO: Should we stop after processing drop_database
+        // event because drop_database event would remove db
+        // from cache and subsequent create_database event would add
+        // new table object in cache?
+        currentEvent.processIfEnabled();
+        if (currentEvent.isDropEvent()) {
+          catalogOpExecutor.addToDeleteEventLog(
+              new ArrayList<NotificationEvent>(Arrays.asList(event)));
+        }
+        if (currentEvent instanceof MetastoreEvents.DropDatabaseEvent) {
+          dbDropped = true;
+          break;
+        }
+      }
+      if (dbDropped) {
+        return;
+      }
+      // setting HMS Event Id after all the events
+      // are successfully processed only if db was not dropped
+      db.setLastSyncedEventId(currentEvent.getEventId());
+      LOG.info("Synced db {} till HMS event {}", db.getName(),
+          currentEvent);
+    }
+  }
+
+  private static NotificationFilter getTableNotificationEventFilter(Table tbl) {
+    NotificationFilter filter = new NotificationFilter() {
+      @Override
+      public boolean accept(NotificationEvent event) {
+
+        if (event.getDbName() != null && event.getTableName() != null) {
+          // TODO: should we ignore case?
+          return tbl.getDb().getName().equalsIgnoreCase(event.getDbName()) &&
+              tbl.getName().equalsIgnoreCase(event.getTableName());
+        }
+        // filter all except db events
+        return event.getDbName() == null;
+      }
+    };
+    return filter;
+  }
+
+  private static NotificationFilter getDbNotificationEventFilter(Db db) {
+    NotificationFilter filter = new NotificationFilter() {
+      @Override
+      public boolean accept(NotificationEvent event) {
+        if (event.getDbName() != null && event.getTableName() == null) {
+          // TODO: should we ignore case?
+          return db.getName().equalsIgnoreCase(event.getDbName());
+        }
+        // filter all events except table events
+        return event.getTableName() == null;
+      }
+    };
+    return filter;
   }
 
   // possible status of event processor
@@ -711,7 +896,7 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
   }
 
   @VisibleForTesting
-  Metrics getMetrics() {
+  protected Metrics getMetrics() {
     return metrics_;
   }
 

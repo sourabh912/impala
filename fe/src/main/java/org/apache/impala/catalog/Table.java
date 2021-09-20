@@ -183,6 +183,8 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
   // Table property key to determined if HMS translated a managed table to external table
   public static final String TBL_PROP_EXTERNAL_TABLE_PURGE = "external.table.purge";
 
+  protected volatile long lastSyncedEventId_ = -1;
+
   protected Table(org.apache.hadoop.hive.metastore.api.Table msTable, Db db,
       String name, String owner) {
     msTable_ = msTable;
@@ -194,11 +196,23 @@ public abstract class Table extends CatalogObjectImpl implements FeTable {
     initMetrics();
   }
 
+  // TODO: Get rid of get and createEventId
+  // once we implement the logic of setting
+  // last synced id in full table reload
   public long getCreateEventId() { return createEventId_; }
 
   public void setCreateEventId(long eventId) {
     this.createEventId_ = eventId;
+    setLastSyncedEventId(eventId);
   }
+
+  public long getLastSyncedEventId() {
+    return lastSyncedEventId_;
+  }
+  public void setLastSyncedEventId(long eventId) {
+    lastSyncedEventId_ = eventId;
+  }
+
   /**
    * Returns if the given HMS table is an external table (uses table type if
    * available or else uses table properties). Implementation is based on org.apache
